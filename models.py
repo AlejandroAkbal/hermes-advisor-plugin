@@ -58,8 +58,9 @@ class AdvisorState:
         if not self.held_notes:
             return ""
         items = "\n".join(
-            f"- [{h['severity'].upper()}] {h['note']}"
+            f"- [{str(h.get('severity', 'note')).upper()}] {h.get('note', '')}"
             for h in self.held_notes
+            if isinstance(h, dict) and h.get("note")
         )
         return (
             "### Held advisories — reconfirm\n\n"
@@ -82,18 +83,13 @@ class AdvisorState:
         previous_held = {
             self.dedupe_key(item.get("note", "")): item
             for item in self.held_notes
-            if item.get("note")
+            if isinstance(item, dict) and item.get("note")
         }
         if not text or not text.strip():
             self.held_notes = []
             return []
 
         text = text.strip()
-
-        # Check for silence signal
-        if "nothing to flag" in text.lower():
-            self.held_notes = []
-            return []
 
         parsed: list[Advice] = []
 
@@ -110,9 +106,15 @@ class AdvisorState:
                     break
 
         if not parsed:
+            # Silence signal — explicit or implicit — resolves every held
+            # note. Checked only when no tagged advice was found, so a stray
+            # "nothing to flag" phrase inside a tagged review cannot clobber
+            # real advice.
+            if "nothing to flag" in text.lower() or len(text) <= 20:
+                self.held_notes = []
+                return []
             # Unstructured response — treat as a concern if it has substance
-            if len(text) > 20:
-                parsed.append(Advice(note=text, severity=Severity.CONCERN))
+            parsed.append(Advice(note=text, severity=Severity.CONCERN))
 
         deliverable: list[Advice] = []
         next_held: dict[str, dict] = {}

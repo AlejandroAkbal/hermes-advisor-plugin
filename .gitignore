@@ -2,6 +2,3 @@ __pycache__/
 *.pyc
 *.pyo
 state.json
-*~
-.*.s[wv]?
-.viminfo

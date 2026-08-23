@@ -33,8 +33,10 @@ def register(ctx):
         description="Toggle/inspect advisor. Usage: /advisor [on|off|status]",
     )
 
-    logger.info("Advisor plugin registered (state=%s)",
-                "enabled" if _runtime.state.enabled else "disabled")
+    logger.info(
+        "Advisor plugin registered (state=%s)",
+        "enabled" if _runtime.state.enabled else "disabled",
+    )
 
 
 def _on_post_llm_call(**kwargs):

@@ -125,7 +125,9 @@ class AdvisorRuntime:
                 data = json.loads(path.read_text())
                 count += len(data.get("held_notes") or [])
             except (json.JSONDecodeError, OSError, TypeError) as exc:
-                logger.warning("Advisor: could not count held notes in %s: %s", path, exc)
+                logger.warning(
+                    "Advisor: could not count held notes in %s: %s", path, exc
+                )
         return count
 
     def _clear_held_notes(self) -> None:
@@ -156,7 +158,8 @@ class AdvisorRuntime:
     # ── hook: end of each agent turn ─────────────────────────────────────
 
     def on_post_llm_call(
-        self, *,
+        self,
+        *,
         session_id: str = "",
         turn_id: str = "",
         user_message: str = "",
@@ -310,7 +313,10 @@ class AdvisorRuntime:
             advisor_provider = self.state.provider
 
         # Call the advisor model — use configured override or inherit primary
-        kwargs = {"messages": messages, "timeout": REVIEW_TIMEOUT_SECONDS}
+        kwargs: dict[str, object] = {
+            "messages": messages,
+            "timeout": REVIEW_TIMEOUT_SECONDS,
+        }
         if advisor_model:
             kwargs["model"] = advisor_model
         if advisor_provider:
@@ -320,7 +326,9 @@ class AdvisorRuntime:
 
         logger.debug(
             "Advisor: review complete, provider=%s model=%s tokens=%d",
-            result.provider, result.model, result.usage.total_tokens if result.usage else 0,
+            result.provider,
+            result.model,
+            result.usage.total_tokens if result.usage else 0,
         )
 
         with self._state_lock:
@@ -383,13 +391,13 @@ class AdvisorRuntime:
         ]
 
     @staticmethod
-    def _format_history(
-        *, user_message: str, response: str, history: list
-    ) -> str:
+    def _format_history(*, user_message: str, response: str, history: list) -> str:
         """Format conversation history into a markdown transcript for review.
 
         Shows the user prompt and the final assistant response.
-        Intermediate tool calls/results are formatted from the history.
+        Intermediate tool calls/results are formatted from the history —
+        restricted to the current turn (everything after the last user
+        message), which is the transcript the reviewer is asked to judge.
         """
         parts = []
 
@@ -397,11 +405,23 @@ class AdvisorRuntime:
         if user_message and user_message.strip():
             parts.append(f"#### User\n\n{user_message.strip()}")
 
-        # Build tool-call and result summary from history
+        # Build tool-call and result summary from the current turn's slice
+        # of the history. The hook carries the full session history; the
+        # advisor reviews one turn, so older tool activity is dropped.
+        last_user = max(
+            (
+                i
+                for i, msg in enumerate(history)
+                if isinstance(msg, dict) and msg.get("role") == "user"
+            ),
+            default=-1,
+        )
+        turn_history = history[last_user + 1 :] if last_user >= 0 else history
+
         tool_calls: list[str] = []
         tool_results: list[str] = []
 
-        for msg in history:
+        for msg in turn_history:
             if not isinstance(msg, dict):
                 continue
             role = msg.get("role", "")
@@ -439,7 +459,8 @@ class AdvisorRuntime:
             elif role == "tool":
                 if isinstance(content, list):
                     text = " ".join(
-                        b.get("text", "") for b in content
+                        b.get("text", "")
+                        for b in content
                         if isinstance(b, dict) and b.get("type") == "text"
                     )
                 elif isinstance(content, dict):
@@ -483,7 +504,9 @@ class AdvisorRuntime:
 
         ok = self.ctx.inject_message(full_msg, role="user")
         if ok:
-            logger.info("Advisor: injected %d item(s) into conversation", len(advice_list))
+            logger.info(
+                "Advisor: injected %d item(s) into conversation", len(advice_list)
+            )
         else:
             logger.info(
                 "Advisor: %d item(s) not injected because CLI delivery is unavailable.",
@@ -525,160 +548,81 @@ class AdvisorRuntime:
     # ── slash command ─────────────────────────────────────────────────────
 
     def handle_command(self, args: str) -> str | None:
-        """Handle /advisor [on|off|status|model|provider|config]."""
-        arg = args.strip().lower()
+        """Handle /advisor [on|off|status|model|provider|providers|models|test].
+
+        Keywords match case-insensitively; values (model names, provider
+        slugs, test notes) keep the case the user typed.
+        """
+        raw = args.strip()
+        tokens = raw.split(None, 1)
+        head = tokens[0].lower() if tokens else ""
+        value = tokens[1].strip() if len(tokens) > 1 else ""
 
         # ── status ──
-        if arg in ("", "status", "config"):
-            state = "enabled" if self.state.enabled else "disabled"
-            model = self.state.model or "(inherit primary)"
-            provider = self.state.provider or "(inherit primary)"
-            held = self._held_count()
-            return (
-                f"Advisor {state}.\n"
-                f"  model:    {model}\n"
-                f"  provider: {provider}\n"
-                f"  held:     {held}\n"
-                f"Usage: /advisor [on|off|status|config|model|provider|providers|models]"
-            )
+        if head in ("", "status", "config") and not (head == "config" and value):
+            return self._format_status()
 
         # ── on ──
-        if arg == "on":
+        if head == "on":
             self.state.enabled = True
             self._save_state()
             return "Advisor on."
 
         # ── off ──
-        if arg == "off":
+        if head == "off":
             self.state.enabled = False
             self._clear_held_notes()
             self._save_state()
             return "Advisor off."
 
         # ── model (no args) — open interactive selector ──
-        if arg == "model":
+        if head == "model" and not value:
             return self._interactive_select()
 
         # ── model <name> ──
-        if arg.startswith("model "):
-            model_name = arg[6:].strip()
-            if not model_name:
-                return "Usage: /advisor model <model-name>"
-            self.state.model = model_name
+        if head == "model":
+            self.state.model = value
             self._save_state()
-            return f"Advisor model set to: {model_name}"
+            return f"Advisor model set to: {value}"
 
         # Provider is selected as the first stage of /advisor model.
-        if arg == "provider":
+        if head == "provider" and not value:
             return "Provider selection is part of /advisor model."
 
         # ── provider <name> ──
-        if arg.startswith("provider "):
-            prov_name = arg[9:].strip()
-            if not prov_name:
-                return "Usage: /advisor provider <provider-name>"
-            self.state.provider = prov_name
+        if head == "provider":
+            self.state.provider = value
             self._save_state()
-            return f"Advisor provider set to: {prov_name}"
+            return f"Advisor provider set to: {value}"
 
         # ── config <key> <value> ──
-        if arg.startswith("config "):
-            # Parse "config model <name>" or "config provider <name>"
-            parts = arg[7:].strip().split(None, 1)
-            if len(parts) != 2:
-                return "Usage: /advisor config <model|provider> <value>"
-            subkey, value = parts
-            if subkey == "model":
-                self.state.model = value
+        if head == "config":
+            sub_tokens = value.split(None, 1)
+            sub = sub_tokens[0].lower() if sub_tokens else ""
+            sub_value = sub_tokens[1].strip() if len(sub_tokens) > 1 else ""
+            if sub == "model" and sub_value:
+                self.state.model = sub_value
                 self._save_state()
-                return f"Advisor model set to: {value}"
-            elif subkey == "provider":
-                self.state.provider = value
+                return f"Advisor model set to: {sub_value}"
+            if sub == "provider" and sub_value:
+                self.state.provider = sub_value
                 self._save_state()
-                return f"Advisor provider set to: {value}"
+                return f"Advisor provider set to: {sub_value}"
             return "Usage: /advisor config <model|provider> <value>"
 
         # ── providers — list available providers ──
-        if arg in ("providers", "list-providers"):
-            lines = ["Configured providers:"]
-            # Read custom providers from config
-            try:
-                from hermes_cli.config import load_config as _load_cfg
-                cfg = _load_cfg()
-                custom = cfg.get("custom_providers", [])
-                for cp in custom:
-                    name = cp.get("name", "?")
-                    url = cp.get("base_url", "")
-                    lines.append(f"  custom:{name}  ({url})")
-            except Exception:
-                pass
-            # Read model catalog for known providers
-            try:
-                from pathlib import Path
-                from hermes_constants import get_hermes_home
-                cat_path = get_hermes_home() / "cache" / "model_catalog.json"
-                if cat_path.exists():
-                    import json
-                    cat = json.loads(cat_path.read_text())
-                    providers_dict = cat.get("providers", {}) or {}
-                    if providers_dict:
-                        lines.append("")
-                        lines.append("Catalog providers:")
-                        for pname in sorted(providers_dict.keys())[:20]:
-                            lines.append(f"  {pname}")
-                        if len(providers_dict) > 20:
-                            lines.append(f"  ... and {len(providers_dict)-20} more")
-            except Exception:
-                pass
-            return "\n".join(lines)
+        if head in ("providers", "list-providers"):
+            return self._list_providers()
 
         # ── models [provider] — list models for a provider ──
-        if arg.startswith("models") or arg.startswith("list-models"):
-            # Parse optional provider argument
-            parts = arg.split(None, 1)
-            target_provider = (parts[1].strip() if len(parts) > 1
-                               else self.state.provider or "")
-            lines = []
-            try:
-                from pathlib import Path
-                from hermes_constants import get_hermes_home
-                import json
-                cat_path = get_hermes_home() / "cache" / "model_catalog.json"
-                if cat_path.exists():
-                    cat = json.loads(cat_path.read_text())
-                    providers_dict = cat.get("providers", {}) or {}
-                    if not target_provider:
-                        lines.append("Usage: /advisor models <provider>")
-                        lines.append("(run /advisor providers first)")
-                    else:
-                        # Normalize: strip custom: prefix for lookup
-                        lookup = target_provider.replace("custom:", "", 1)
-                        models = providers_dict.get(lookup, [])
-                        if not models:
-                            lines.append(f"No models found for '{target_provider}'.")
-                            lines.append(f"Check /advisor providers for valid names.")
-                        else:
-                            lines.append(f"Models for {target_provider}:")
-                            for m in sorted(models)[:30]:
-                                lines.append(f"  {m}")
-                            if len(models) > 30:
-                                lines.append(f"  ... and {len(models)-30} more")
-                else:
-                    lines.append("No model catalog found (run hermes once to populate).")
-                    lines.append("Common models for opencode-go:")
-                    lines.append("  mimo-v2.5, mimo-v2.5-pro, minimax-m3")
-                    lines.append("  deepseek-v4-pro, deepseek-v4-flash")
-                    lines.append("  glm-5, glm-5.1, glm-5.2")
-                    lines.append("  kimi-k2.6, kimi-k2.7-code")
-                    lines.append("  qwen3.6-plus, qwen3.7-max")
-            except Exception as e:
-                lines.append(f"Error reading model catalog: {e}")
-            return "\n".join(lines)
+        if head in ("models", "list-models"):
+            return self._list_models(value)
 
         # ── test — inject a test advice message ──
-        if arg.startswith("test"):
+        if head == "test":
             import re
-            m = re.match(r"^test\s+(nit|concern|blocker)\s+([\s\S]+)$", arg, re.IGNORECASE)
+
+            m = re.match(r"(nit|concern|blocker)\s+([\s\S]+)$", value, re.IGNORECASE)
             if m:
                 sev = Severity(m.group(1).lower())
                 note = m.group(2).strip()
@@ -687,3 +631,93 @@ class AdvisorRuntime:
             return "Usage: /advisor test <nit|concern|blocker> <note>"
 
         return "Usage: /advisor [on|off|status|config|model|provider|providers|models|test]"
+
+    def _format_status(self) -> str:
+        state = "enabled" if self.state.enabled else "disabled"
+        model = self.state.model or "(inherit primary)"
+        provider = self.state.provider or "(inherit primary)"
+        held = self._held_count()
+        return (
+            f"Advisor {state}.\n"
+            f"  model:    {model}\n"
+            f"  provider: {provider}\n"
+            f"  held:     {held}\n"
+            f"Usage: /advisor [on|off|status|config|model|provider|providers|models]"
+        )
+
+    def _picker_providers(self) -> list[dict]:
+        """Provider rows from the same source the native model picker uses."""
+        try:
+            from hermes_cli.inventory import build_models_payload, load_picker_context
+
+            with self._state_lock:
+                provider = self.state.provider
+                model = self.state.model
+            context = load_picker_context().with_overrides(
+                current_provider=provider,
+                current_model=model,
+            )
+            # No live probing: a slash command listing must not stall on
+            # slow or offline custom endpoints. Rows still carry their
+            # cached/configured models.
+            payload = build_models_payload(context, probe_custom_providers=False)
+            return [p for p in (payload.get("providers") or []) if isinstance(p, dict)]
+        except Exception as exc:
+            logger.warning("Advisor: could not load provider list: %s", exc)
+            return []
+
+    def _list_providers(self) -> str:
+        providers = self._picker_providers()
+        if not providers:
+            return (
+                "No configured providers found. Add one via hermes setup "
+                "or model.provider in config.yaml."
+            )
+        lines = ["Providers available to /advisor model:"]
+        for p in providers:
+            slug = p.get("slug") or "?"
+            label = p.get("name") or slug
+            marker = "  (current)" if p.get("is_current") else ""
+            lines.append(f"  {slug}  —  {label}{marker}")
+        return "\n".join(lines)
+
+    def _list_models(self, provider_arg: str) -> str:
+        target = (provider_arg or "").strip()
+        with self._state_lock:
+            target = target or self.state.provider or ""
+        providers = self._picker_providers()
+        if not target:
+            if not providers:
+                return (
+                    "No configured providers found. Add one via hermes setup "
+                    "or model.provider in config.yaml."
+                )
+            return "Usage: /advisor models <provider>\n(run /advisor providers first)"
+        row = next(
+            (
+                p
+                for p in providers
+                if str(p.get("slug") or "").lower() == target.lower()
+            ),
+            None,
+        )
+        if row is None:
+            return (
+                f"No provider '{target}' found. Run /advisor providers for valid names."
+            )
+        models = [m for m in (row.get("models") or []) if isinstance(m, str)]
+        total = row.get("total_models")
+        if not models:
+            return (
+                f"No models listed for '{target}'. Open /advisor model to pick "
+                "interactively, or refresh the model catalog."
+            )
+        lines = [f"Models for {target}:"]
+        shown = sorted(models)[:30]
+        for m in shown:
+            lines.append(f"  {m}")
+        hidden = len(models) - len(shown)
+        capped = (total - len(models)) if isinstance(total, int) else 0
+        if hidden or capped > 0:
+            lines.append(f"  ... and {hidden + max(capped, 0)} more")
+        return "\n".join(lines)
