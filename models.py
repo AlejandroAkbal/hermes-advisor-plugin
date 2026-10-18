@@ -1,8 +1,46 @@
 """Advisor data models."""
 
+import json
+import logging
 import re
 from dataclasses import dataclass, field
 from enum import Enum
+
+logger = logging.getLogger(__name__)
+
+# A review note is prose advice. These markers mean the model returned leaked
+# machine output instead — a tool call it tried to make, or raw structured
+# data. Such a note is dropped (with a WARNING) rather than delivered or held:
+# a malformed review must cost silence, not garbage in the agent's context.
+_TOOL_CALL_MARKERS = (
+    "<tool_call>",
+    "</tool_call>",
+    "<function",
+    "<parameter",
+    "<tool_use",
+    "<invoke",
+)
+MAX_NOTE_CHARS = 1200
+
+
+def is_malformed_note(note: str) -> bool:
+    """True when a note is leaked machine output rather than prose advice."""
+    if not note or not note.strip():
+        return True
+    stripped = note.strip()
+    if len(stripped) > MAX_NOTE_CHARS:
+        return True
+    lowered = stripped.casefold()
+    if any(marker in lowered for marker in _TOOL_CALL_MARKERS):
+        return True
+    # Bare JSON payload — a dict/list serialised straight into the review.
+    if stripped[0] in "{[":
+        try:
+            json.loads(stripped)
+            return True
+        except (ValueError, TypeError):
+            pass
+    return False
 
 
 class Severity(str, Enum):
@@ -58,9 +96,8 @@ class AdvisorState:
         if not self.held_notes:
             return ""
         items = "\n".join(
-            f"- [{str(h.get('severity', 'note')).upper()}] {h.get('note', '')}"
+            f"- [{h['severity'].upper()}] {h['note']}"
             for h in self.held_notes
-            if isinstance(h, dict) and h.get("note")
         )
         return (
             "### Held advisories — reconfirm\n\n"
@@ -83,13 +120,18 @@ class AdvisorState:
         previous_held = {
             self.dedupe_key(item.get("note", "")): item
             for item in self.held_notes
-            if isinstance(item, dict) and item.get("note")
+            if item.get("note")
         }
         if not text or not text.strip():
             self.held_notes = []
             return []
 
         text = text.strip()
+
+        # Check for silence signal
+        if "nothing to flag" in text.lower():
+            self.held_notes = []
+            return []
 
         parsed: list[Advice] = []
 
@@ -101,20 +143,31 @@ class AdvisorState:
                 tag = f"[{sev.value.upper()}]"
                 if tag in line:
                     note = line.replace(tag, "").strip().strip(":").strip()
-                    if note:
+                    if note and is_malformed_note(note):
+                        logger.warning(
+                            "Advisor: dropping malformed %s note (%d chars): %.120s",
+                            sev.value,
+                            len(note),
+                            note,
+                        )
+                    elif note:
                         parsed.append(Advice(note=note, severity=sev))
                     break
 
         if not parsed:
-            # Silence signal — explicit or implicit — resolves every held
-            # note. Checked only when no tagged advice was found, so a stray
-            # "nothing to flag" phrase inside a tagged review cannot clobber
-            # real advice.
-            if "nothing to flag" in text.lower() or len(text) <= 20:
-                self.held_notes = []
-                return []
-            # Unstructured response — treat as a concern if it has substance
-            parsed.append(Advice(note=text, severity=Severity.CONCERN))
+            # Unstructured response — a prose reply with substance is a concern,
+            # but leaked tool-call or structured output is machine noise, not
+            # advice. Drop it so a bad review costs silence, not context.
+            if len(text) > 20:
+                if is_malformed_note(text):
+                    logger.warning(
+                        "Advisor: dropping malformed unstructured review "
+                        "(%d chars): %.120s",
+                        len(text),
+                        text,
+                    )
+                else:
+                    parsed.append(Advice(note=text, severity=Severity.CONCERN))
 
         deliverable: list[Advice] = []
         next_held: dict[str, dict] = {}

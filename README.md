@@ -9,6 +9,9 @@ by Petr Baudis (pasky), which brought the oh-my-pi advisor onto upstream pi's
 extension surface. This is the same idea, adapted to Hermes' plugin system and
 its different hook model.
 
+I have been running this in my own Hermes setup (HermeL on gigul2) and it has
+fired correctly every time — zero false positives so far.
+
 ## What it does
 
 The advisor is a stateless reviewer that runs after every completed agent turn.
@@ -58,7 +61,15 @@ emission, only after a later review raises the same normalized note again.
 
 ## Installation
 
-The plugin ships with Hermes Agent. Enable it in `config.yaml`:
+```bash
+# 1. From the Hermes plugin catalog — a human-merged, SHA-pinned entry:
+hermes plugins install advisor
+
+# …or straight from this repository at a commit you choose:
+hermes plugins install https://github.com/ljubomirj/hermes-advisor-plugin
+```
+
+Then enable it in `config.yaml`:
 
 ```yaml
 plugins:
@@ -68,14 +79,33 @@ plugins:
 
 Or at runtime: `/advisor on`
 
+Check the install before trusting it — the same gate the catalog runs at
+admission:
+
+```bash
+hermes plugins validate <plugin-dir>   # manifest, hooks, capability probe, security scan
+```
+
 ### Prerequisites
 
-- A Hermes build with `PluginContext.request_model_selection` (included with
-  the in-tree advisor plugin), plus `ctx.register_hook`, `ctx.llm.complete`, and
-  `ctx.register_command`
+- Hermes >= 0.21, with `ctx.register_hook`, `ctx.register_command`,
+  `ctx.llm.complete` and (for the interactive picker)
+  `PluginContext.request_model_selection`
 - A Hermes profile with at least one LLM provider configured
 
 ## Configuration
+
+### Enable the plugin
+
+The plugin is **disabled by default**. Enable it in config.yaml:
+
+```yaml
+plugins:
+  enabled:
+    - advisor
+```
+
+Or at runtime: `/advisor on`
 
 ### Trust gate for provider/model overrides
 
@@ -115,10 +145,11 @@ runtime:
 ```
 
 **Interactive selector** (`/advisor model` with no arguments): opens the same
-prompt_toolkit-native provider+model modal that `/model` uses. Select a
-provider, then a model — the result is applied to the advisor's override while
-your primary model config stays untouched.
+curses-based provider+model picker that `hermes model` uses. Select a provider,
+then a model — the result is applied to the advisor's override while your primary
+model config stays untouched.
 
+The interactive selector uses the same prompt_toolkit-native modal as `/model`.
 It does not spawn a subprocess, take over the terminal, or write and restore the
 primary `model.*` configuration. The selected provider/model pair is returned
 to the plugin callback and stored only in advisor state. This path is shared on
@@ -128,12 +159,11 @@ Model and provider are independently settable. Set only `model` to use a
 different model on the same provider. Set both to route to a completely
 different provider and auth.
 
-Check what's available — both listings use the same provider/model source as
-the interactive picker:
+Check what's available:
 
 ```
-/advisor providers           # list configured providers
-/advisor models openrouter   # list models for a provider
+/advisor providers           # list known providers
+/advisor models opencode-go  # list models for a provider
 /advisor status              # show current config
 ```
 
@@ -142,11 +172,12 @@ the active profile. Held concerns and blockers are stored under
 `$HERMES_HOME/advisor/sessions/`, scoped to the conversation. Existing
 package-local settings are read once and migrated.
 
-**A pairing that works well:** keep the primary agent on your usual coding
-model and point the advisor at a fast mid-sized model from a provider you
-already have credentials for — e.g. `/advisor model <fast-model>` after
-configuring that provider in Hermes. A cheap, quick second opinion on every
-turn catches more than an expensive one that lags the conversation.
+**Real-world setup (author's daily driver):** the primary agent runs
+**DeepSeek-V4-Flash** with `thinking=high` and the advisor runs
+**MiMo-V2.5** — two mid-sized (~300B params) fast models, both routed
+through the same OpenCode Go subscription. Set with `/advisor model mimo-v2.5`
+after configuring `custom:opencode-go` as a provider in Hermes. This pairing
+gives responsive primary work with a capable second opinion on every turn.
 
 ### Project guidance (WATCHDOG.md)
 
@@ -167,8 +198,8 @@ rules, recurring pitfalls — without touching the main agent's prompt.
 /advisor config           — same as /advisor status
 /advisor config model <name>     — same as /advisor model
 /advisor config provider <name>  — same as /advisor provider
-/advisor providers        — list configured providers
-/advisor models <provider> — list models for a provider
+/advisor providers        — list known providers (from the plugin provider registry)
+/advisor models <provider> — list that provider's models (live catalog, else its curated list)
 /advisor test <severity> <note>  — inject a test advisory (for testing delivery)
 ```
 
@@ -205,14 +236,14 @@ rules, recurring pitfalls — without touching the main agent's prompt.
 
 If the advisor keeps flagging something you've already addressed (like a stale
 `[BLOCKER]` or `[CONCERN]` that won't clear), the held notes need resetting.
-Do the "IT Crowd" fixit:
+Do the the "IT Crowd" fixit:
 
 ```
 /advisor off
 /advisor on
 ```
 
-This clears all held notes and starts fresh. Concerns and blockers are stored in
+This clears all held notes and starts fresh. Concerns and blockers are stored in 
 `$HERMES_HOME/advisor/sessions/` and survive agent restarts, so stale items can
 accumulate across sessions. The toggle is the surest reset.
 

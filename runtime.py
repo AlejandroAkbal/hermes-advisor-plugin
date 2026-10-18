@@ -125,9 +125,7 @@ class AdvisorRuntime:
                 data = json.loads(path.read_text())
                 count += len(data.get("held_notes") or [])
             except (json.JSONDecodeError, OSError, TypeError) as exc:
-                logger.warning(
-                    "Advisor: could not count held notes in %s: %s", path, exc
-                )
+                logger.warning("Advisor: could not count held notes in %s: %s", path, exc)
         return count
 
     def _clear_held_notes(self) -> None:
@@ -158,8 +156,7 @@ class AdvisorRuntime:
     # ── hook: end of each agent turn ─────────────────────────────────────
 
     def on_post_llm_call(
-        self,
-        *,
+        self, *,
         session_id: str = "",
         turn_id: str = "",
         user_message: str = "",
@@ -313,10 +310,7 @@ class AdvisorRuntime:
             advisor_provider = self.state.provider
 
         # Call the advisor model — use configured override or inherit primary
-        kwargs: dict[str, object] = {
-            "messages": messages,
-            "timeout": REVIEW_TIMEOUT_SECONDS,
-        }
+        kwargs = {"messages": messages, "timeout": REVIEW_TIMEOUT_SECONDS}
         if advisor_model:
             kwargs["model"] = advisor_model
         if advisor_provider:
@@ -326,9 +320,7 @@ class AdvisorRuntime:
 
         logger.debug(
             "Advisor: review complete, provider=%s model=%s tokens=%d",
-            result.provider,
-            result.model,
-            result.usage.total_tokens if result.usage else 0,
+            result.provider, result.model, result.usage.total_tokens if result.usage else 0,
         )
 
         with self._state_lock:
@@ -391,13 +383,13 @@ class AdvisorRuntime:
         ]
 
     @staticmethod
-    def _format_history(*, user_message: str, response: str, history: list) -> str:
+    def _format_history(
+        *, user_message: str, response: str, history: list
+    ) -> str:
         """Format conversation history into a markdown transcript for review.
 
         Shows the user prompt and the final assistant response.
-        Intermediate tool calls/results are formatted from the history —
-        restricted to the current turn (everything after the last user
-        message), which is the transcript the reviewer is asked to judge.
+        Intermediate tool calls/results are formatted from the history.
         """
         parts = []
 
@@ -405,23 +397,11 @@ class AdvisorRuntime:
         if user_message and user_message.strip():
             parts.append(f"#### User\n\n{user_message.strip()}")
 
-        # Build tool-call and result summary from the current turn's slice
-        # of the history. The hook carries the full session history; the
-        # advisor reviews one turn, so older tool activity is dropped.
-        last_user = max(
-            (
-                i
-                for i, msg in enumerate(history)
-                if isinstance(msg, dict) and msg.get("role") == "user"
-            ),
-            default=-1,
-        )
-        turn_history = history[last_user + 1 :] if last_user >= 0 else history
-
+        # Build tool-call and result summary from history
         tool_calls: list[str] = []
         tool_results: list[str] = []
 
-        for msg in turn_history:
+        for msg in history:
             if not isinstance(msg, dict):
                 continue
             role = msg.get("role", "")
@@ -459,8 +439,7 @@ class AdvisorRuntime:
             elif role == "tool":
                 if isinstance(content, list):
                     text = " ".join(
-                        b.get("text", "")
-                        for b in content
+                        b.get("text", "") for b in content
                         if isinstance(b, dict) and b.get("type") == "text"
                     )
                 elif isinstance(content, dict):
@@ -504,9 +483,7 @@ class AdvisorRuntime:
 
         ok = self.ctx.inject_message(full_msg, role="user")
         if ok:
-            logger.info(
-                "Advisor: injected %d item(s) into conversation", len(advice_list)
-            )
+            logger.info("Advisor: injected %d item(s) into conversation", len(advice_list))
         else:
             logger.info(
                 "Advisor: %d item(s) not injected because CLI delivery is unavailable.",
@@ -530,10 +507,21 @@ class AdvisorRuntime:
                 f"({result.provider_label or result.target_provider})"
             )
 
+        # Optional seam: builds without ``request_model_selection`` keep the
+        # text commands (``/advisor provider``, ``/advisor model <name>``) and
+        # say so, instead of raising AttributeError on every picker attempt.
+        request_selection = getattr(self.ctx, "request_model_selection", None)
+        if not callable(request_selection):
+            return (
+                "Interactive advisor model selection is not available in this "
+                "Hermes build.\nUse /advisor provider <name> and "
+                "/advisor model <name> here."
+            )
+
         with self._state_lock:
             current_provider = self.state.provider
             current_model = self.state.model
-        opened = self.ctx.request_model_selection(
+        opened = request_selection(
             apply_selection,
             current_provider=current_provider,
             current_model=current_model,
@@ -575,7 +563,7 @@ class AdvisorRuntime:
             self._save_state()
             return "Advisor off."
 
-        # ── model (no args) — open interactive selector ──
+        # ── model (no args) — open the native provider/model picker ──
         if head == "model" and not value:
             return self._interactive_select()
 
@@ -610,11 +598,11 @@ class AdvisorRuntime:
                 return f"Advisor provider set to: {sub_value}"
             return "Usage: /advisor config <model|provider> <value>"
 
-        # ── providers — list available providers ──
+        # ── providers — the picker's provider rows (no private catalog) ──
         if head in ("providers", "list-providers"):
             return self._list_providers()
 
-        # ── models [provider] — list models for a provider ──
+        # ── models [provider] — the picker's model rows (no private catalog) ──
         if head in ("models", "list-models"):
             return self._list_models(value)
 
@@ -645,41 +633,50 @@ class AdvisorRuntime:
             f"Usage: /advisor [on|off|status|config|model|provider|providers|models]"
         )
 
-    def _picker_providers(self) -> list[dict]:
-        """Provider rows from the same source the native model picker uses."""
-        try:
-            from hermes_cli.inventory import build_models_payload, load_picker_context
+    def _provider_rows(self) -> list[dict]:
+        """Provider rows for the text listings, from the documented plugin seam.
 
-            with self._state_lock:
-                provider = self.state.provider
-                model = self.state.model
-            context = load_picker_context().with_overrides(
-                current_provider=provider,
-                current_model=model,
-            )
-            # Same composition as the CLI's /model picker (``_show_model_picker``):
-            # for the same provider, the same models, in the same order. Probing
-            # stays limited to the selected custom endpoint, exactly as on a
-            # picker open, so a slash command never fans out across endpoints.
-            payload = build_models_payload(
-                context,
-                probe_custom_providers=False,
-                probe_current_custom_provider=True,
-                capabilities=True,
-                for_picker=True,
-                fast_custom_probe=False,
-            )
-            return [p for p in (payload.get("providers") or []) if isinstance(p, dict)]
+        ``providers`` (``list_providers`` / ``get_provider_profile``) is the
+        documented extension point — the same provider registry the native
+        ``/model`` picker is built from — whereas ``hermes_cli.inventory`` is
+        core-internal and carries no compatibility promise (catalog rule 9).
+
+        The interactive path is unaffected: ``/advisor model`` opens Hermes' own
+        picker through ``ctx.request_model_selection``, so no catalog of the
+        advisor's own is ever needed for selection. These rows only feed the
+        text listings, for surfaces where a modal cannot open (gateway, plain
+        output).
+        """
+        try:
+            from providers import list_providers
+
+            profiles = list_providers()
         except Exception as exc:
-            logger.warning("Advisor: could not load provider list: %s", exc)
+            logger.warning("Advisor: could not load the provider registry: %s", exc)
             return []
 
+        with self._state_lock:
+            current = (self.state.provider or "").strip().lower()
+        rows = []
+        for profile in profiles:
+            slug = (getattr(profile, "name", "") or "").strip()
+            if not slug:
+                continue
+            label = (getattr(profile, "display_name", "") or "").strip() or slug
+            rows.append({
+                "slug": slug,
+                "name": label,
+                "is_current": bool(current) and slug.lower() == current,
+                "models": list(getattr(profile, "fallback_models", []) or []),
+            })
+        return rows
+
     def _list_providers(self) -> str:
-        providers = self._picker_providers()
+        providers = self._provider_rows()
         if not providers:
             return (
-                "No configured providers found. Add one via hermes setup "
-                "or model.provider in config.yaml."
+                "No providers found in the plugin provider registry. "
+                "Add one via hermes setup or model.provider in config.yaml."
             )
         lines = ["Providers available to /advisor model:"]
         for p in providers:
@@ -693,32 +690,33 @@ class AdvisorRuntime:
         target = (provider_arg or "").strip()
         with self._state_lock:
             target = target or self.state.provider or ""
-        providers = self._picker_providers()
         if not target:
-            if not providers:
-                return (
-                    "No configured providers found. Add one via hermes setup "
-                    "or model.provider in config.yaml."
-                )
             return "Usage: /advisor models <provider>\n(run /advisor providers first)"
-        row = next(
-            (
-                p
-                for p in providers
-                if str(p.get("slug") or "").lower() == target.lower()
-            ),
-            None,
-        )
-        if row is None:
+        try:
+            from providers import get_provider_profile
+
+            profile = get_provider_profile(target)
+        except Exception as exc:
+            logger.warning("Advisor: provider lookup failed for %r: %s", target, exc)
+            profile = None
+        if profile is None:
             return (
                 f"No provider '{target}' found. Run /advisor providers for valid names."
             )
-        models = [m for m in (row.get("models") or []) if isinstance(m, str)]
-        total = row.get("total_models")
+        # A profile owns its catalog: fetch live ids (public contract, the profile
+        # resolves its own credentials), else fall back to its curated list.
+        models: list[str] = []
+        try:
+            models = [m for m in (profile.fetch_models() or []) if isinstance(m, str)]
+        except Exception as exc:
+            logger.debug("Advisor: catalog fetch failed for %s: %s", target, exc)
+        if not models:
+            models = [m for m in (getattr(profile, "fallback_models", []) or []) if isinstance(m, str)]
+        total = None
         if not models:
             return (
                 f"No models listed for '{target}'. Open /advisor model to pick "
-                "interactively, or refresh the model catalog."
+                "interactively, or refresh with /model --refresh."
             )
         lines = [f"Models for {target}:"]
         shown = sorted(models)[:30]

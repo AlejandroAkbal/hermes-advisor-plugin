@@ -1,8 +1,9 @@
 name: advisor
-version: "1.0.0"
+version: "1.2.0"
 description: "Persistent second-model review for each agent turn. Port of pi-omplike-advisor for Hermes."
 author: Ljubomir Josifovski (ljubomirj) — based on original by Petr Baudis (pasky)
 license: MIT
-hooks:
+requires_hermes: ">=0.21"
+provides_hooks:
   - post_llm_call
   - on_session_finalize
