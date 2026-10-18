@@ -657,10 +657,18 @@ class AdvisorRuntime:
                 current_provider=provider,
                 current_model=model,
             )
-            # No live probing: a slash command listing must not stall on
-            # slow or offline custom endpoints. Rows still carry their
-            # cached/configured models.
-            payload = build_models_payload(context, probe_custom_providers=False)
+            # Same composition as the CLI's /model picker (``_show_model_picker``):
+            # for the same provider, the same models, in the same order. Probing
+            # stays limited to the selected custom endpoint, exactly as on a
+            # picker open, so a slash command never fans out across endpoints.
+            payload = build_models_payload(
+                context,
+                probe_custom_providers=False,
+                probe_current_custom_provider=True,
+                capabilities=True,
+                for_picker=True,
+                fast_custom_probe=False,
+            )
             return [p for p in (payload.get("providers") or []) if isinstance(p, dict)]
         except Exception as exc:
             logger.warning("Advisor: could not load provider list: %s", exc)
