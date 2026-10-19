@@ -238,6 +238,24 @@ rules, recurring pitfalls — without touching the main agent's prompt.
 |---|---|
 | `ADVISOR_NO_REVIEW=1` | Skip live model reviews. Keeps the `/advisor test` delivery path for manual testing. |
 
+## Disclosure
+
+What a user should know before installing (catalog rule 13):
+
+- **Network calls.** Each reviewed turn makes one LLM completion through
+  Hermes's own route (`ctx.llm.complete()`), billed to the provider that serves
+  the advisor model — by default the same one as the primary agent. No other
+  network calls, no telemetry, no usage reporting.
+- **Reads.** The full turn transcript handed to the `post_llm_call` hook, plus
+  this plugin's own state file. Nothing outside the plugin's data directory.
+- **No shell, no file writes outside its state.** The advisor model produces
+  text only: it never calls tools, edits files or changes session state.
+- **Background work.** One worker thread per process reviews turns; it is a
+  daemon and is given a one-second grace period at shutdown.
+- **State.** `$HERMES_HOME/advisor/state.json` (per profile): enabled flag,
+  advisor provider/model, and the held notes used by the hold-and-reconfirm
+  rule. No credentials — the advisor model's credentials stay in Hermes.
+
 ## Caveats
 
 - **`inject_message` is CLI only.** On Telegram, Discord, or other gateway
