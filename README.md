@@ -93,6 +93,35 @@ hermes plugins validate <plugin-dir>   # manifest, hooks, capability probe, secu
   `PluginContext.request_model_selection`
 - A Hermes profile with at least one LLM provider configured
 
+## Development
+
+This repository is the source of truth — including the R&D copy. Do not keep a
+python copy of the plugin inside a Hermes checkout: load *this* directory into a
+profile instead, so there is one tree to edit, one git history, and `hermes
+plugins update`/`check-updates` still see the origin:
+
+```bash
+ln -s "$PWD" "$HERMES_HOME/plugins/advisor"      # profile plugins dir; discovery follows symlinks
+hermes plugins adopt advisor                     # optional: record provenance from git origin
+hermes plugins validate "$PWD"                   # manifest, hooks, capability probe, security scan
+```
+
+Editing a file takes effect on the next Hermes start — no copy step, no rebuild.
+
+### Publishing a version to the catalog
+
+`plugin-catalog/advisor.yaml` in the Hermes repository pins one commit SHA, and
+every bump is a new reviewed PR. `scripts/pin-catalog-entry.sh` does the whole
+step, from the pushed commit (it refuses to pin a worktree that is not
+`origin/main`, and it checks the pushed manifest declares a version and its
+hooks, the two things that failed admission once):
+
+```bash
+git commit -am "advisor: <what changed>" && git push
+scripts/pin-catalog-entry.sh            # rewrites sha + docs_url, validates the entry
+scripts/pin-catalog-entry.sh --check    # same checks, writes nothing
+```
+
 ## Configuration
 
 ### Enable the plugin
