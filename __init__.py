@@ -15,10 +15,56 @@ logger = logging.getLogger(__name__)
 _runtime: AdvisorRuntime | None = None
 
 
+CONSULT_ADVISOR_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "consult_advisor",
+        "description": (
+            "Consult your senior coworker / Staff Architect (Claude Opus 5.5 / GPT-5.6 Sol) "
+            "before starting substantive work, making architectural choices, or writing non-trivial code. "
+            "Pass your goal and proposed approach to receive strategic guidance, cleaner patterns, "
+            "and edge cases to watch for."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "The goal, feature, or bug you are working on.",
+                },
+                "proposed_approach": {
+                    "type": "string",
+                    "description": "Your initial plan or the architectural choices you are considering.",
+                },
+            },
+            "required": ["task"],
+        },
+    },
+}
+
+
+def _handle_consult_advisor(task: str, proposed_approach: str = "") -> str:
+    """Tool handler: runs on-demand advisor consultation."""
+    runtime = _get_runtime()
+    if runtime is None:
+        return "Advisor plugin not initialized."
+    return runtime.consult_advisor(task=task, proposed_approach=proposed_approach)
+
+
 def register(ctx):
     global _runtime
 
     _runtime = AdvisorRuntime(ctx)
+
+    # Register the consult_advisor tool for in-turn architectural consultation
+    ctx.register_tool(
+        name="consult_advisor",
+        toolset="advisor",
+        schema=CONSULT_ADVISOR_SCHEMA,
+        handler=_handle_consult_advisor,
+        description="Consult senior coworker/architect for strategic design advice and cleaner patterns.",
+        emoji="🧠",
+    )
 
     # Register the post_llm_call hook — fires once per turn at completion.
     # Kwargs include: turn_id, user_message, assistant_response,

@@ -1,9 +1,11 @@
 name: advisor
-version: "1.2.0"
-description: "Persistent second-model review for each agent turn. Port of pi-omplike-advisor for Hermes."
-author: Ljubomir Josifovski (ljubomirj) — based on original by Petr Baudis (pasky)
+version: "2.0.0"
+description: "AI Coworker for Hermes: active on-demand architect tool + parallel background oversight."
+author: Alejandro Akbal, Ljubomir Josifovski, Petr Baudis
 license: MIT
 requires_hermes: ">=0.21"
 provides_hooks:
   - post_llm_call
   - on_session_finalize
+provides_tools:
+  - consult_advisor

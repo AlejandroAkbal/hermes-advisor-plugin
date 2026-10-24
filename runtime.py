@@ -335,6 +335,37 @@ class AdvisorRuntime:
             self._save_session_state(session_id, review_state)
             return advice
 
+    def consult_advisor(self, *, task: str, proposed_approach: str = "") -> str:
+        """On-demand senior architect consultation during a turn."""
+        prompt = (
+            "You are a Staff Software Architect paired with a coding agent. "
+            "The agent is consulting you for architectural and design guidance before taking action.\n\n"
+            f"### Task / Goal:\n{task}\n\n"
+        )
+        if proposed_approach:
+            prompt += f"### Proposed Approach:\n{proposed_approach}\n\n"
+        prompt += (
+            "Provide high-signal, concise (300-600 words) architectural direction:\n"
+            "1. Recommended Pattern & Approach: The cleanest, most robust, idiomatic way to solve this.\n"
+            "2. Potential Pitfalls & Edge Cases: Subtleties to watch out for.\n"
+            "3. Existing Libraries / Primitives: Any standard or battle-tested libraries to prefer over custom code.\n"
+            "Be direct, practical, and specific."
+        )
+
+        messages = [
+            {"role": "system", "content": "You are a senior Staff Software Architect advising a coding agent."},
+            {"role": "user", "content": prompt},
+        ]
+
+        kwargs = {"messages": messages, "timeout": REVIEW_TIMEOUT_SECONDS}
+        if self.state.model:
+            kwargs["model"] = self.state.model
+        if self.state.provider:
+            kwargs["provider"] = self.state.provider
+
+        result = self.ctx.llm.complete(**kwargs)
+        return result.text.strip()
+
     def _build_review_prompt(
         self,
         *,
@@ -402,11 +433,12 @@ class AdvisorRuntime:
         if user_message and user_message.strip():
             parts.append(f"#### User\n\n{user_message.strip()}")
 
-        # Build tool-call and result summary from history
+        # Build tool-call and result summary from history (capped to recent 30 messages)
         tool_calls: list[str] = []
         tool_results: list[str] = []
 
-        for msg in history:
+        recent_history = history[-30:] if len(history) > 30 else history
+        for msg in recent_history:
             if not isinstance(msg, dict):
                 continue
             role = msg.get("role", "")

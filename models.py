@@ -9,10 +9,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# A review note is prose advice. These markers mean the model returned leaked
-# machine output instead — a tool call it tried to make, or raw structured
-# data. Such a note is dropped (with a WARNING) rather than delivered or held:
-# a malformed review must cost silence, not garbage in the agent's context.
+# Markers indicating leaked machine output rather than prose advice.
 _TOOL_CALL_MARKERS = (
     "<tool_call>",
     "</tool_call>",
@@ -21,7 +18,7 @@ _TOOL_CALL_MARKERS = (
     "<tool_use",
     "<invoke",
 )
-MAX_NOTE_CHARS = 1200
+MAX_NOTE_CHARS = 4000
 
 
 def is_malformed_note(note: str) -> bool:
@@ -45,12 +42,18 @@ def is_malformed_note(note: str) -> bool:
 
 
 class Severity(str, Enum):
+    SUGGESTION = "suggestion"
     NIT = "nit"
     CONCERN = "concern"
     BLOCKER = "blocker"
 
 
-SEVERITY_RANK = {Severity.NIT: 1, Severity.CONCERN: 2, Severity.BLOCKER: 3}
+SEVERITY_RANK = {
+    Severity.SUGGESTION: 1,
+    Severity.NIT: 1,
+    Severity.CONCERN: 2,
+    Severity.BLOCKER: 3,
+}
 
 
 @dataclass
@@ -58,7 +61,7 @@ class Advice:
     """A single piece of advice with severity."""
 
     note: str
-    severity: Severity = Severity.NIT
+    severity: Severity = Severity.SUGGESTION
 
     def tag(self) -> str:
         return f"[{self.severity.value.upper()}]"
@@ -102,100 +105,51 @@ class AdvisorState:
             for h in self.held_notes
         )
         return (
-            "### Held advisories — reconfirm\n\n"
-            "You raised these on an earlier step; they were held pending reconfirmation, "
-            "because by now the agent may have already addressed them. Re-check each "
-            "against the latest activity below.\n\n"
-            "For every item that STILL applies, raise it again — same severity, or higher "
-            "if it's gotten worse. Say nothing for the rest — silence drops them.\n\n"
+            "### Prior observations\n\n"
             f"{items}\n\n---"
         )
 
     def parse_response(self, text: str) -> list[Advice]:
-        """Parse a review and return only advice that should be delivered.
-
-        Nits are delivered immediately. A concern or blocker is held on first
-        sight and becomes deliverable only when a later review raises the same
-        normalized note again. Held notes omitted by the latest review are
-        considered resolved and removed.
-        """
-        previous_held = {
-            self.dedupe_key(item.get("note", "")): item
-            for item in self.held_notes
-            if item.get("note")
-        }
+        """Parse coworker review and return actionable advice to deliver immediately."""
         if not text or not text.strip():
             self.held_notes = []
             return []
 
         text = text.strip()
-
-        # Check for silence signal
-        if "nothing to flag" in text.lower():
+        if "nothing to flag" in text.lower() and len(text) < 40:
             self.held_notes = []
             return []
 
         parsed: list[Advice] = []
 
-        for line in text.split("\n"):
-            line = line.strip()
-            if not line:
-                continue
-            for sev in Severity:
-                tag = f"[{sev.value.upper()}]"
-                if tag in line:
-                    note = line.replace(tag, "").strip().strip(":").strip()
-                    if note and is_malformed_note(note):
-                        logger.warning(
-                            "Advisor: dropping malformed %s note (%d chars): %.120s",
-                            sev.value,
-                            len(note),
-                            note,
-                        )
-                    elif note:
-                        parsed.append(Advice(note=note, severity=sev))
-                    break
+        # Find all tagged blocks: [SUGGESTION], [CONCERN], [BLOCKER], [NIT]
+        pattern = r"\[(SUGGESTION|CONCERN|BLOCKER|NIT)\]"
+        matches = list(re.finditer(pattern, text, re.IGNORECASE))
 
-        if not parsed:
-            # Unstructured response — a prose reply with substance is a concern,
-            # but leaked tool-call or structured output is machine noise, not
-            # advice. Drop it so a bad review costs silence, not context.
+        if matches:
+            for idx, m in enumerate(matches):
+                tag_str = m.group(1).lower()
+                sev = Severity(tag_str)
+                start_pos = m.end()
+                end_pos = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+                note_content = text[start_pos:end_pos].strip().strip(":").strip()
+                if note_content and not is_malformed_note(note_content):
+                    parsed.append(Advice(note=note_content, severity=sev))
+                elif note_content:
+                    logger.warning(
+                        "Advisor: dropping malformed %s note (%d chars)",
+                        sev.value, len(note_content),
+                    )
+        else:
+            # Unstructured response
             if len(text) > 20:
                 if is_malformed_note(text):
-                    logger.warning(
-                        "Advisor: dropping malformed unstructured review "
-                        "(%d chars): %.120s",
-                        len(text),
-                        text,
-                    )
+                    logger.warning("Advisor: dropping malformed unstructured review (%d chars)", len(text))
                 else:
-                    parsed.append(Advice(note=text, severity=Severity.CONCERN))
+                    parsed.append(Advice(note=text, severity=Severity.SUGGESTION))
 
-        deliverable: list[Advice] = []
-        next_held: dict[str, dict] = {}
-        for advice in parsed:
-            if advice.severity == Severity.NIT:
-                deliverable.append(advice)
-                continue
-
-            key = self.dedupe_key(advice.note)
-            if key in previous_held:
-                deliverable.append(advice)
-
-            current = next_held.get(key)
-            if current is None:
-                next_held[key] = {
-                    "note": advice.note,
-                    "severity": advice.severity.value,
-                }
-                continue
-
-            old_rank = SEVERITY_RANK[Severity(current["severity"])]
-            if SEVERITY_RANK[advice.severity] > old_rank:
-                current["severity"] = advice.severity.value
-
-        self.held_notes = list(next_held.values())
-        return deliverable
+        self.held_notes = []
+        return parsed
 
     def serialize(self) -> dict:
         return {
