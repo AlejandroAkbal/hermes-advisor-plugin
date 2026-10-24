@@ -493,21 +493,41 @@ class AdvisorRuntime:
     ) -> str:
         """Format conversation history into a markdown transcript for review.
 
-        Shows the user prompt and the final assistant response.
-        Intermediate tool calls/results are formatted from the history.
+        Shows the user prompt, tool calls/results made in THIS turn, and the assistant response.
+        Brief context from recent prior turns is included without smearing old tool executions.
         """
         parts = []
 
-        # User message
-        if user_message and user_message.strip():
-            parts.append(f"#### User\n\n{user_message.strip()}")
+        # Find where this turn started (last user message)
+        last_user = max(
+            (i for i, m in enumerate(history) if isinstance(m, dict) and m.get("role") == "user"),
+            default=-1,
+        )
 
-        # Build tool-call and result summary from history (capped to recent 30 messages)
+        # Brief summary of prior turns for context (up to 3 prior turns, text only)
+        if last_user > 0:
+            prior_exchanges = []
+            for msg in history[:last_user]:
+                if not isinstance(msg, dict):
+                    continue
+                role = msg.get("role")
+                content = msg.get("content", "")
+                if role == "user" and content and not content.strip().startswith("◆ Advisor review"):
+                    prior_exchanges.append(f"- User: {content.strip()[:150]}")
+                elif role == "assistant" and content:
+                    prior_exchanges.append(f"- Assistant: {content.strip()[:150]}")
+            if prior_exchanges:
+                parts.append("### Prior Context (Recent Conversation)\n" + "\n".join(prior_exchanges[-6:]))
+
+        # Current turn user message
+        parts.append(f"### Current Turn Being Reviewed\n#### User\n\n{(user_message or '').strip()}")
+
+        # Build tool-call and result summary for the CURRENT TURN ONLY
         tool_calls: list[str] = []
         tool_results: list[str] = []
 
-        recent_history = history[-30:] if len(history) > 30 else history
-        for msg in recent_history:
+        current_turn_msgs = history[last_user + 1:] if last_user >= 0 else history
+        for msg in current_turn_msgs:
             if not isinstance(msg, dict):
                 continue
             role = msg.get("role", "")
@@ -529,7 +549,7 @@ class AdvisorRuntime:
                         tc_text = json.dumps(tc_args, ensure_ascii=False, indent=1)
                     else:
                         tc_text = str(tc_args)
-                    tool_calls.append(f"\u2192 tool `{tc_name}`: {tc_text[:500]}")
+                    tool_calls.append(f"→ tool `{tc_name}`: {tc_text[:800]}")
 
                 # Retain compatibility with providers that use content blocks.
                 if isinstance(content, list):
@@ -540,8 +560,8 @@ class AdvisorRuntime:
                                 tc_args = block.get("arguments", block.get("input", {}))
                                 tc_str = json.dumps(
                                     tc_args, ensure_ascii=False, indent=1
-                                )[:500]
-                                tool_calls.append(f"\u2192 tool `{tc_name}`: {tc_str}")
+                                )[:800]
+                                tool_calls.append(f"→ tool `{tc_name}`: {tc_str}")
             elif role == "tool":
                 if isinstance(content, list):
                     text = " ".join(
@@ -555,13 +575,13 @@ class AdvisorRuntime:
                 if text.strip():
                     tool_name = msg.get("name") or "tool"
                     tool_results.append(
-                        f"\u2192 `{tool_name}` result: {text.strip()[:500]}"
+                        f"→ `{tool_name}` result: {text.strip()[:1200]}"
                     )
 
         if tool_calls:
-            parts.append("#### Tool calls\n\n" + "\n".join(tool_calls))
+            parts.append("#### Tool calls in this turn\n\n" + "\n".join(tool_calls))
         if tool_results:
-            parts.append("#### Tool results\n\n" + "\n".join(tool_results))
+            parts.append("#### Tool results in this turn\n\n" + "\n".join(tool_results))
 
         # Assistant response (clipped to 4000 chars, preserving head and tail)
         if response and response.strip():

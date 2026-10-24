@@ -103,6 +103,31 @@ class TestAdvisorRuntime(unittest.TestCase):
         self.assertIn("... [truncated] ...", resp_text)
         self.assertLess(len(resp_text), len(long_text))
 
+    def test_format_history_scopes_tool_calls_to_current_turn(self):
+        _format_history = runtime_mod.AdvisorRuntime._format_history
+        history = [
+            {"role": "user", "content": "previous task"},
+            {"role": "assistant", "tool_calls": [{"id": "c1", "function": {"name": "old_tool", "arguments": "{}"}}]},
+            {"role": "tool", "name": "old_tool", "content": "old result"},
+            {"role": "assistant", "content": "old task done"},
+            {"role": "user", "content": "current task"},
+            {"role": "assistant", "tool_calls": [{"id": "c2", "function": {"name": "current_tool", "arguments": "{\"arg\": 1}"}}]},
+            {"role": "tool", "name": "current_tool", "content": "current result"},
+        ]
+        formatted = _format_history(user_message="current task", response="current response", history=history)
+
+        # Prior context should be summarized
+        self.assertIn("Prior Context", formatted)
+        self.assertIn("previous task", formatted)
+
+        # Current tool should be in the tool calls section
+        self.assertIn("current_tool", formatted)
+        self.assertIn("current result", formatted)
+
+        # Old tool calls from previous turn MUST NOT be in the current turn's tool calls
+        self.assertNotIn("old_tool", formatted)
+        self.assertNotIn("old result", formatted)
+
 
 if __name__ == "__main__":
     unittest.main()
