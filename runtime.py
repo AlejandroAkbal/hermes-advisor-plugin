@@ -43,7 +43,11 @@ def _find_guidelines(cwd: str) -> str:
 def _is_substantive_turn(user_msg: str, asst_resp: str, history: list) -> bool:
     """True when this turn involved tool calls, code, or substantive technical explanation."""
     last_user = max((i for i, m in enumerate(history) if isinstance(m, dict) and m.get("role") == "user"), default=-1)
-    recent = history[last_user + 1:] if last_user >= 0 else history
+    if last_user >= 0:
+        recent = history[last_user + 1:]
+    else:
+        # If history contains no user message, do not assume prior messages belong to this turn
+        recent = []
     for msg in recent:
         if isinstance(msg, dict):
             if msg.get("role") == "tool" or msg.get("tool_calls"):
