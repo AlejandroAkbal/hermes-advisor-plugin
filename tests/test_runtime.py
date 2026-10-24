@@ -169,8 +169,21 @@ class TestAdvisorRuntime(unittest.TestCase):
         self.assertEqual(collected[0], "Initial project goal: build a reliable tool.")
 
         # 3. Individual snippets must be capped at 600 chars (+ truncation marker)
-        for d in collected:
+        for d in collected[1:]:
             self.assertLessEqual(len(d), 650)
+
+    def test_clip_directive_preserves_trailing_instructions(self):
+        _clip_directive = runtime_mod._clip_directive
+        # Giant pasted log with instruction at the end
+        giant_paste = "LOG_TRACE_START " + ("X" * 10000) + " LOG_TRACE_END\nFix this, but stay on main and do not touch auth."
+        clipped = _clip_directive(giant_paste, 600)
+
+        # Leading context preserved
+        self.assertTrue(clipped.startswith("LOG_TRACE_START"))
+        # Trailing instruction preserved
+        self.assertIn("stay on main and do not touch auth.", clipped)
+        # Total length within budget
+        self.assertLessEqual(len(clipped), 650)
 
 
 if __name__ == "__main__":

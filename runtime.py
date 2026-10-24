@@ -59,14 +59,26 @@ def _is_substantive_turn(user_msg: str, asst_resp: str, history: list) -> bool:
 
 
 MAX_DIRECTIVES_CHARS = 8000
-PER_MSG_CHARS = 600
+ANCHOR_CAP = 2000
+SNIPPET_CAP = 600
+
+
+def _clip_directive(text: str, cap: int) -> str:
+    """Clip a directive preserving both leading context and trailing instructions."""
+    text = text.strip()
+    if len(text) <= cap:
+        return text
+    head = cap * 2 // 5
+    tail = cap - head - 20
+    return f"{text[:head]} …[{len(text) - cap} chars]… {text[-tail:]}"
 
 
 def _collect_directives(user_msgs: list[str]) -> list[str]:
     """Collect human user directives with an overall character budget.
 
-    Preserves the initial task framing (first message) and walks newest-to-oldest
-    so recent scope decisions and authorizations take priority without blowing up tokens.
+    Preserves the initial task framing (first message, up to ANCHOR_CAP)
+    and walks newest-to-oldest with balanced head-and-tail clipping so
+    trailing instructions in long pastes survive.
     """
     if not user_msgs:
         return []
@@ -81,15 +93,13 @@ def _collect_directives(user_msgs: list[str]) -> list[str]:
     if not cleaned:
         return []
 
-    first = cleaned[0]
-    first_snippet = first if len(first) <= PER_MSG_CHARS else first[:PER_MSG_CHARS] + " …[truncated]"
-
+    first_snippet = _clip_directive(cleaned[0], ANCHOR_CAP)
     rest = cleaned[1:]
     kept_rev = []
     used = len(first_snippet)
 
     for m in reversed(rest):
-        snippet = m if len(m) <= PER_MSG_CHARS else m[:PER_MSG_CHARS] + " …[truncated]"
+        snippet = _clip_directive(m, SNIPPET_CAP)
         if used + len(snippet) > MAX_DIRECTIVES_CHARS:
             break
         kept_rev.append(snippet)
