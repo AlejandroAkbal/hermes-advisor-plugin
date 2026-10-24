@@ -147,6 +147,31 @@ class TestAdvisorRuntime(unittest.TestCase):
         # The authorization from turn 1 MUST be visible to the advisor even after 10+ intermediate turns!
         self.assertIn("No, do everything on main. No need to change to another branch.", formatted)
 
+    def test_collect_directives_budget_bounding(self):
+        _collect_directives = runtime_mod._collect_directives
+        # Simulated 200-message session with long log pastes
+        user_msgs = ["Initial project goal: build a reliable tool."]
+        for i in range(150):
+            if i == 5:
+                user_msgs.append("Important authorization: work on main directly.")
+            elif i % 2 == 0:
+                user_msgs.append("A" * 1500)  # long pasted log
+            else:
+                user_msgs.append(f"Command execution {i}")
+
+        collected = _collect_directives(user_msgs)
+
+        # 1. Total characters must be under budget (8,000 chars)
+        total_chars = sum(len(d) for d in collected)
+        self.assertLessEqual(total_chars, 8000)
+
+        # 2. First message (framing) must be preserved
+        self.assertEqual(collected[0], "Initial project goal: build a reliable tool.")
+
+        # 3. Individual snippets must be capped at 600 chars (+ truncation marker)
+        for d in collected:
+            self.assertLessEqual(len(d), 650)
+
 
 if __name__ == "__main__":
     unittest.main()

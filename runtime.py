@@ -58,6 +58,46 @@ def _is_substantive_turn(user_msg: str, asst_resp: str, history: list) -> bool:
     return False
 
 
+MAX_DIRECTIVES_CHARS = 8000
+PER_MSG_CHARS = 600
+
+
+def _collect_directives(user_msgs: list[str]) -> list[str]:
+    """Collect human user directives with an overall character budget.
+
+    Preserves the initial task framing (first message) and walks newest-to-oldest
+    so recent scope decisions and authorizations take priority without blowing up tokens.
+    """
+    if not user_msgs:
+        return []
+
+    cleaned = []
+    for m in user_msgs:
+        m_str = (m or "").strip()
+        if not m_str or m_str in {"...", "…"} or m_str.startswith("◆ Advisor review"):
+            continue
+        cleaned.append(m_str)
+
+    if not cleaned:
+        return []
+
+    first = cleaned[0]
+    first_snippet = first if len(first) <= PER_MSG_CHARS else first[:PER_MSG_CHARS] + " …[truncated]"
+
+    rest = cleaned[1:]
+    kept_rev = []
+    used = len(first_snippet)
+
+    for m in reversed(rest):
+        snippet = m if len(m) <= PER_MSG_CHARS else m[:PER_MSG_CHARS] + " …[truncated]"
+        if used + len(snippet) > MAX_DIRECTIVES_CHARS:
+            break
+        kept_rev.append(snippet)
+        used += len(snippet)
+
+    return [first_snippet] + list(reversed(kept_rev))
+
+
 class AdvisorRuntime:
     """Tracks turns and triggers reviews via the advisor model.
 
@@ -504,20 +544,18 @@ class AdvisorRuntime:
             default=-1,
         )
 
-        # Collect all human user directives across the session
+        # Collect human user directives across the session, budget-bounded
         # User messages carry crucial decisions, authorizations, and constraints.
-        user_directives = []
+        user_msgs = []
         if last_user > 0:
             for msg in history[:last_user]:
-                if not isinstance(msg, dict):
-                    continue
-                if msg.get("role") == "user":
-                    c = (msg.get("content") or "").strip()
-                    if c and not c.startswith("◆ Advisor review"):
-                        user_directives.append(f"- User: {c[:2000]}")
+                if isinstance(msg, dict) and msg.get("role") == "user":
+                    user_msgs.append(msg.get("content") or "")
 
-        if user_directives:
-            parts.append("### User Directives & History (Session Context)\n" + "\n".join(user_directives))
+        directives = _collect_directives(user_msgs)
+        if directives:
+            formatted_directives = [f"- User: {d}" for d in directives]
+            parts.append("### User Directives & History (Session Context)\n" + "\n".join(formatted_directives))
 
         # Brief summary of recent assistant turns for continuity (last 3 assistant responses)
         recent_asst = []
