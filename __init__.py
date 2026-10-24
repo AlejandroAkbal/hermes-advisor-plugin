@@ -43,12 +43,13 @@ CONSULT_ADVISOR_SCHEMA = {
 }
 
 
-def _handle_consult_advisor(task: str, proposed_approach: str = "") -> str:
+def _handle_consult_advisor(task: str, proposed_approach: str = "", **kwargs) -> str:
     """Tool handler: runs on-demand advisor consultation."""
     runtime = _get_runtime()
     if runtime is None:
         return "Advisor plugin not initialized."
-    return runtime.consult_advisor(task=task, proposed_approach=proposed_approach)
+    session_id = kwargs.get("session_id", "")
+    return runtime.consult_advisor(task=task, proposed_approach=proposed_approach, session_id=session_id)
 
 
 def register(ctx):

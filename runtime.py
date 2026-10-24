@@ -21,18 +21,22 @@ REVIEW_TIMEOUT_SECONDS = 90
 SHUTDOWN_GRACE_SECONDS = 1.0
 
 
-def _read_project_guidelines(cwd: str) -> str:
-    """Read project guidance from WATCHDOG.md, AGENTS.md, or CLAUDE.md."""
-    base = Path(cwd)
-    for name in (WATCHDOG_FILENAME, "AGENTS.md", "CLAUDE.md"):
-        target = base / name
-        if target.exists():
-            try:
-                content = target.read_text().strip()
-                if content:
-                    return content[:4000]
-            except OSError:
-                continue
+def _find_guidelines(cwd: str) -> str:
+    """Find WATCHDOG.md, AGENTS.md, or CLAUDE.md by walking up from cwd to git root."""
+    try:
+        base = Path(cwd).resolve()
+        for d in [base, *base.parents]:
+            for name in (WATCHDOG_FILENAME, "AGENTS.md", "CLAUDE.md"):
+                p = d / name
+                if p.is_file():
+                    try:
+                        return p.read_text(encoding="utf-8", errors="replace").strip()[:4000]
+                    except OSError:
+                        pass
+            if (d / ".git").exists():
+                break
+    except Exception:
+        pass
     return ""
 
 
@@ -354,7 +358,26 @@ class AdvisorRuntime:
             self._save_session_state(session_id, review_state)
             return advice
 
-    def consult_advisor(self, *, task: str, proposed_approach: str = "") -> str:
+    def _session_cwd(self, session_id: str = "") -> str:
+        """Resolve session working directory from state.db or fallback to getcwd."""
+        if not session_id:
+            return os.getcwd()
+        try:
+            import sqlite3
+            from hermes_constants import get_hermes_home
+            db_path = get_hermes_home() / "state.db"
+            if db_path.exists():
+                with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT cwd FROM sessions WHERE id = ? LIMIT 1", (session_id,))
+                    row = cursor.fetchone()
+                    if row and row[0]:
+                        return row[0]
+        except Exception:
+            pass
+        return os.getcwd()
+
+    def consult_advisor(self, *, task: str, proposed_approach: str = "", session_id: str = "") -> str:
         """On-demand senior architect consultation during a turn."""
         prompt = (
             "You are a Staff Software Architect paired with a coding agent. "
@@ -364,7 +387,8 @@ class AdvisorRuntime:
         if proposed_approach:
             prompt += f"### Proposed Approach:\n{proposed_approach}\n\n"
 
-        guidelines = _read_project_guidelines(os.getcwd())
+        cwd = self._session_cwd(session_id) or os.getcwd()
+        guidelines = _find_guidelines(cwd)
         if guidelines:
             prompt += f"### Project Guidelines & Architecture (from repo):\n{guidelines}\n\n"
 
@@ -405,7 +429,7 @@ class AdvisorRuntime:
         system_prompt = ADVISOR_SYSTEM_PROMPT
 
         # Append project guidelines if present (WATCHDOG.md, AGENTS.md, or CLAUDE.md)
-        guidelines = _read_project_guidelines(cwd)
+        guidelines = _find_guidelines(cwd)
         if guidelines:
             system_prompt += (
                 f"\n\nEspecially pay attention to project guidelines:\n"
