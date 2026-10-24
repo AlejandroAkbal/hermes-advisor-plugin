@@ -183,6 +183,10 @@ class AdvisorRuntime:
         if not conversation_history:
             return
 
+        # Loop guard: do not review turns triggered by an advisor review injection
+        if (user_message or "").strip().startswith("◆ Advisor review"):
+            return
+
         logger.debug(
             "Advisor: turn %s complete, user=%s, model=%s, msgs=%d",
             turn_id,
