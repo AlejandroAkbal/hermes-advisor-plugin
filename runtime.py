@@ -21,6 +21,21 @@ REVIEW_TIMEOUT_SECONDS = 90
 SHUTDOWN_GRACE_SECONDS = 1.0
 
 
+def _read_project_guidelines(cwd: str) -> str:
+    """Read project guidance from WATCHDOG.md, AGENTS.md, or CLAUDE.md."""
+    base = Path(cwd)
+    for name in (WATCHDOG_FILENAME, "AGENTS.md", "CLAUDE.md"):
+        target = base / name
+        if target.exists():
+            try:
+                content = target.read_text().strip()
+                if content:
+                    return content[:4000]
+            except OSError:
+                continue
+    return ""
+
+
 class AdvisorRuntime:
     """Tracks turns and triggers reviews via the advisor model.
 
@@ -348,6 +363,11 @@ class AdvisorRuntime:
         )
         if proposed_approach:
             prompt += f"### Proposed Approach:\n{proposed_approach}\n\n"
+
+        guidelines = _read_project_guidelines(os.getcwd())
+        if guidelines:
+            prompt += f"### Project Guidelines & Architecture (from repo):\n{guidelines}\n\n"
+
         prompt += (
             "Provide high-signal, concise (300-600 words) architectural direction:\n"
             "1. Recommended Pattern & Approach: The cleanest, most robust, idiomatic way to solve this.\n"
@@ -384,18 +404,13 @@ class AdvisorRuntime:
         # Base system prompt
         system_prompt = ADVISOR_SYSTEM_PROMPT
 
-        # Append WATCHDOG.md if present
-        watchdog_path = Path(cwd) / WATCHDOG_FILENAME
-        if watchdog_path.exists():
-            try:
-                wd_content = watchdog_path.read_text().strip()
-                if wd_content:
-                    system_prompt += (
-                        f"\n\nEspecially pay attention to:\n"
-                        f"<attention>\n{wd_content}\n</attention>"
-                    )
-            except OSError as exc:
-                logger.warning("Advisor: could not read %s: %s", watchdog_path, exc)
+        # Append project guidelines if present (WATCHDOG.md, AGENTS.md, or CLAUDE.md)
+        guidelines = _read_project_guidelines(cwd)
+        if guidelines:
+            system_prompt += (
+                f"\n\nEspecially pay attention to project guidelines:\n"
+                f"<guidelines>\n{guidelines}\n</guidelines>"
+            )
 
         # Build the user content: reconfirm preamble + turn transcript
         user_content_parts = []
@@ -498,9 +513,12 @@ class AdvisorRuntime:
         if tool_results:
             parts.append("#### Tool results\n\n" + "\n".join(tool_results))
 
-        # Assistant response
+        # Assistant response (clipped to 4000 chars to keep token usage bounded)
         if response and response.strip():
-            parts.append(f"#### Assistant\n\n{response.strip()}")
+            resp_text = response.strip()
+            if len(resp_text) > 4000:
+                resp_text = resp_text[:4000] + "\n... [truncated]"
+            parts.append(f"#### Assistant\n\n{resp_text}")
 
         return "\n\n".join(parts)
 
