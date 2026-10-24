@@ -185,6 +185,45 @@ class TestAdvisorRuntime(unittest.TestCase):
         # Total length within budget
         self.assertLessEqual(len(clipped), 650)
 
+    def test_advisor_depth_stateless_counting(self):
+        _advisor_depth = runtime_mod._advisor_depth
+        prefix = runtime_mod.ADVISOR_INJECTION_PREFIX
+
+        # 1. Normal human turn -> depth 0
+        h1 = [
+            {"role": "user", "content": "build feature"},
+            {"role": "assistant", "content": "built feature"},
+        ]
+        self.assertEqual(_advisor_depth(h1), 0)
+
+        # 2. One advisor injection -> depth 1
+        h2 = h1 + [
+            {"role": "user", "content": f"{prefix}\n\n[CONCERN] bug in feature"},
+            {"role": "assistant", "content": "fixed bug"},
+        ]
+        self.assertEqual(_advisor_depth(h2), 1)
+
+        # 3. Second advisor injection -> depth 2
+        h3 = h2 + [
+            {"role": "user", "content": f"{prefix}\n\n[CONCERN] secondary bug"},
+            {"role": "assistant", "content": "fixed secondary bug"},
+        ]
+        self.assertEqual(_advisor_depth(h3), 2)
+
+        # 4. Human user sends a message -> resets to 0
+        h4 = h3 + [
+            {"role": "user", "content": "looks great, next task"},
+            {"role": "assistant", "content": "working on next task"},
+        ]
+        self.assertEqual(_advisor_depth(h4), 0)
+
+    def test_nothing_to_flag_produces_no_injections(self):
+        from hermes_plugins.advisor.models import AdvisorState
+        state = AdvisorState()
+        # Clean response must yield 0 advice items
+        self.assertEqual(state.parse_response("nothing to flag"), [])
+        self.assertEqual(state.parse_response("Nothing to flag."), [])
+
 
 if __name__ == "__main__":
     unittest.main()

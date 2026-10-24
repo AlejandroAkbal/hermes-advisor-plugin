@@ -58,6 +58,25 @@ def _is_substantive_turn(user_msg: str, asst_resp: str, history: list) -> bool:
     return False
 
 
+ADVISOR_INJECTION_PREFIX = "◆ Advisor review"
+
+
+def _advisor_depth(messages: list) -> int:
+    """Count consecutive advisor injections since the last genuine human user message."""
+    depth = 0
+    for m in reversed(messages or []):
+        if not isinstance(m, dict):
+            continue
+        if m.get("role") != "user":
+            continue
+        content = (m.get("content") or "").lstrip()
+        if content.startswith(ADVISOR_INJECTION_PREFIX):
+            depth += 1
+        else:
+            break
+    return depth
+
+
 MAX_DIRECTIVES_CHARS = 8000
 ANCHOR_CAP = 2000
 SNIPPET_CAP = 600
@@ -270,8 +289,14 @@ class AdvisorRuntime:
         if not conversation_history:
             return
 
-        # Loop guard: do not review turns triggered by an advisor review injection
-        if (user_message or "").strip().startswith("◆ Advisor review"):
+        # Multi-round depth guard: count consecutive advisor injections since last human message
+        depth = _advisor_depth(conversation_history)
+        max_rounds = getattr(self.state, "max_rounds", 2)
+        if depth >= max_rounds:
+            logger.debug(
+                "Advisor: skipping review, reached max consecutive review depth (%d/%d)",
+                depth, max_rounds,
+            )
             return
 
         # Activity gate: skip review on trivial conversational turns with no tool calls
@@ -793,6 +818,18 @@ class AdvisorRuntime:
         if head in ("models", "list-models"):
             return self._list_models(value)
 
+        # ── rounds <n> ──
+        if head in ("rounds", "max-rounds"):
+            try:
+                n = int(value)
+                if n < 1 or n > 20:
+                    return "Rounds must be between 1 and 20."
+                self.state.max_rounds = n
+                self._save_state()
+                return f"Advisor max rounds set to: {n}"
+            except ValueError:
+                return "Usage: /advisor rounds <1-20>"
+
         # ── test — inject a test advice message ──
         if head == "test":
             import re
@@ -805,19 +842,21 @@ class AdvisorRuntime:
                 return f"Advisor: delivered test {sev.value}."
             return "Usage: /advisor test <nit|concern|blocker> <note>"
 
-        return "Usage: /advisor [on|off|status|config|model|provider|providers|models|test]"
+        return "Usage: /advisor [on|off|status|config|model|provider|providers|models|rounds|test]"
 
     def _format_status(self) -> str:
         state = "enabled" if self.state.enabled else "disabled"
         model = self.state.model or "(inherit primary)"
         provider = self.state.provider or "(inherit primary)"
+        max_rounds = getattr(self.state, "max_rounds", 2)
         held = self._held_count()
         return (
             f"Advisor {state}.\n"
-            f"  model:    {model}\n"
-            f"  provider: {provider}\n"
-            f"  held:     {held}\n"
-            f"Usage: /advisor [on|off|status|config|model|provider|providers|models]"
+            f"  model:      {model}\n"
+            f"  provider:   {provider}\n"
+            f"  max rounds: {max_rounds}\n"
+            f"  held:       {held}\n"
+            f"Usage: /advisor [on|off|status|config|model|provider|rounds]"
         )
 
     def _provider_rows(self) -> list[dict]:

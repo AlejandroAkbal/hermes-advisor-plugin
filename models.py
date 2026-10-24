@@ -89,6 +89,7 @@ class AdvisorState:
     # Per-advisor model override — empty means inherit primary model
     model: str = ""
     provider: str = ""
+    max_rounds: int = 2
 
     def dedupe_key(self, note: str) -> str:
         return re.sub(r"\s+", " ", note.strip()).casefold()
@@ -157,6 +158,7 @@ class AdvisorState:
             "held_notes": self.held_notes,
             "model": self.model,
             "provider": self.provider,
+            "max_rounds": self.max_rounds,
         }
 
     @classmethod
@@ -166,4 +168,5 @@ class AdvisorState:
             held_notes=data.get("held_notes", []),
             model=data.get("model", ""),
             provider=data.get("provider", ""),
+            max_rounds=int(data.get("max_rounds", 2)),
         )
