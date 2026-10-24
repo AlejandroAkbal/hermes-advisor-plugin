@@ -40,6 +40,19 @@ def _find_guidelines(cwd: str) -> str:
     return ""
 
 
+def _is_substantive_turn(user_msg: str, asst_resp: str, history: list) -> bool:
+    """True when a turn involved tool calls, code, or substantive technical explanation."""
+    recent = history[-10:] if len(history) > 10 else history
+    for msg in recent:
+        if isinstance(msg, dict):
+            if msg.get("role") == "tool" or msg.get("tool_calls"):
+                return True
+    text = (asst_resp or "").strip()
+    if "```" in text or len(text) >= 200:
+        return True
+    return False
+
+
 class AdvisorRuntime:
     """Tracks turns and triggers reviews via the advisor model.
 
@@ -204,6 +217,10 @@ class AdvisorRuntime:
 
         # Loop guard: do not review turns triggered by an advisor review injection
         if (user_message or "").strip().startswith("◆ Advisor review"):
+            return
+
+        # Activity gate: skip review on trivial conversational turns with no tool calls
+        if not _is_substantive_turn(user_message, assistant_response, conversation_history):
             return
 
         logger.debug(
@@ -379,26 +396,30 @@ class AdvisorRuntime:
 
     def consult_advisor(self, *, task: str, proposed_approach: str = "", session_id: str = "") -> str:
         """On-demand senior architect consultation during a turn."""
-        prompt = (
-            "You are a Staff Software Architect paired with a coding agent. "
-            "The agent is consulting you for architectural and design guidance before taking action.\n\n"
-            f"### Task / Goal:\n{task}\n\n"
-        )
-        if proposed_approach:
-            prompt += f"### Proposed Approach:\n{proposed_approach}\n\n"
-
         cwd = self._session_cwd(session_id) or os.getcwd()
         guidelines = _find_guidelines(cwd)
-        if guidelines:
-            prompt += f"### Project Guidelines & Architecture (from repo):\n{guidelines}\n\n"
 
-        prompt += (
+        # Prefix caching optimization: static instructions & repo guidelines come FIRST
+        prompt_parts = [
+            "You are a Staff Software Architect paired with a coding agent. "
+            "The agent is consulting you for architectural and design guidance before taking action.\n"
+        ]
+        if guidelines:
+            prompt_parts.append(f"### Project Guidelines & Architecture (from repo):\n{guidelines}\n")
+
+        prompt_parts.append(
+            "### Instructions:\n"
             "Provide high-signal, concise (300-600 words) architectural direction:\n"
             "1. Recommended Pattern & Approach: The cleanest, most robust, idiomatic way to solve this.\n"
             "2. Potential Pitfalls & Edge Cases: Subtleties to watch out for.\n"
             "3. Existing Libraries / Primitives: Any standard or battle-tested libraries to prefer over custom code.\n"
-            "Be direct, practical, and specific."
+            "Be direct, practical, and specific.\n"
         )
+        prompt_parts.append(f"### Task / Goal:\n{task}\n")
+        if proposed_approach:
+            prompt_parts.append(f"### Proposed Approach:\n{proposed_approach}\n")
+
+        prompt = "\n".join(prompt_parts)
 
         messages = [
             {"role": "system", "content": "You are a senior Staff Software Architect advising a coding agent."},
@@ -537,11 +558,11 @@ class AdvisorRuntime:
         if tool_results:
             parts.append("#### Tool results\n\n" + "\n".join(tool_results))
 
-        # Assistant response (clipped to 4000 chars to keep token usage bounded)
+        # Assistant response (clipped to 4000 chars, preserving head and tail)
         if response and response.strip():
             resp_text = response.strip()
             if len(resp_text) > 4000:
-                resp_text = resp_text[:4000] + "\n... [truncated]"
+                resp_text = resp_text[:1500] + "\n... [truncated] ...\n" + resp_text[-2500:]
             parts.append(f"#### Assistant\n\n{resp_text}")
 
         return "\n\n".join(parts)
