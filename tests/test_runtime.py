@@ -117,7 +117,7 @@ class TestAdvisorRuntime(unittest.TestCase):
         formatted = _format_history(user_message="current task", response="current response", history=history)
 
         # Prior context should be summarized
-        self.assertIn("Prior Context", formatted)
+        self.assertIn("User Directives & History", formatted)
         self.assertIn("previous task", formatted)
 
         # Current tool should be in the tool calls section
@@ -127,6 +127,25 @@ class TestAdvisorRuntime(unittest.TestCase):
         # Old tool calls from previous turn MUST NOT be in the current turn's tool calls
         self.assertNotIn("old_tool", formatted)
         self.assertNotIn("old result", formatted)
+
+    def test_format_history_preserves_earlier_user_authorizations(self):
+        _format_history = runtime_mod.AdvisorRuntime._format_history
+        # 12 turns of back-and-forth where early on user gives an authorization
+        history = [
+            {"role": "user", "content": "No, do everything on main. No need to change to another branch."},
+            {"role": "assistant", "content": "Understood, will do everything on main."},
+        ]
+        for i in range(10):
+            history.append({"role": "user", "content": f"step {i}"})
+            history.append({"role": "assistant", "content": f"completed step {i}"})
+
+        history.append({"role": "user", "content": "is it ready?"})
+        history.append({"role": "assistant", "content": "Yes, all done."})
+
+        formatted = _format_history(user_message="is it ready?", response="Yes, all done.", history=history)
+
+        # The authorization from turn 1 MUST be visible to the advisor even after 10+ intermediate turns!
+        self.assertIn("No, do everything on main. No need to change to another branch.", formatted)
 
 
 if __name__ == "__main__":

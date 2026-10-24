@@ -504,20 +504,31 @@ class AdvisorRuntime:
             default=-1,
         )
 
-        # Brief summary of prior turns for context (up to 3 prior turns, text only)
+        # Collect all human user directives across the session
+        # User messages carry crucial decisions, authorizations, and constraints.
+        user_directives = []
         if last_user > 0:
-            prior_exchanges = []
             for msg in history[:last_user]:
                 if not isinstance(msg, dict):
                     continue
-                role = msg.get("role")
-                content = msg.get("content", "")
-                if role == "user" and content and not content.strip().startswith("◆ Advisor review"):
-                    prior_exchanges.append(f"- User: {content.strip()[:150]}")
-                elif role == "assistant" and content:
-                    prior_exchanges.append(f"- Assistant: {content.strip()[:150]}")
-            if prior_exchanges:
-                parts.append("### Prior Context (Recent Conversation)\n" + "\n".join(prior_exchanges[-6:]))
+                if msg.get("role") == "user":
+                    c = (msg.get("content") or "").strip()
+                    if c and not c.startswith("◆ Advisor review"):
+                        user_directives.append(f"- User: {c[:2000]}")
+
+        if user_directives:
+            parts.append("### User Directives & History (Session Context)\n" + "\n".join(user_directives))
+
+        # Brief summary of recent assistant turns for continuity (last 3 assistant responses)
+        recent_asst = []
+        if last_user > 0:
+            for msg in history[:last_user]:
+                if isinstance(msg, dict) and msg.get("role") == "assistant":
+                    c = (msg.get("content") or "").strip()
+                    if c:
+                        recent_asst.append(f"- Assistant: {c[:250]}")
+            if recent_asst:
+                parts.append("### Recent Assistant Context\n" + "\n".join(recent_asst[-3:]))
 
         # Current turn user message
         parts.append(f"### Current Turn Being Reviewed\n#### User\n\n{(user_message or '').strip()}")
