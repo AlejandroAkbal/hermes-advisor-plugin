@@ -475,6 +475,29 @@ class TestAdvisorRuntime(unittest.TestCase):
         res = rt.on_transform_llm_output(response_text="file1.txt was found.", session_id="s_ok")
         self.assertIsNone(res)
 
+    def test_transform_llm_output_disabled_returns_none(self):
+        class MockCtx:
+            pass
+        rt = runtime_mod.AdvisorRuntime(MockCtx())
+        rt.state.enabled = False
+        rt.record_tool_call(tool_name="terminal", args={"command": "ls"}, result="out", session_id="s_dis")
+        res = rt.on_transform_llm_output(response_text="done", session_id="s_dis")
+        self.assertIsNone(res)
+
+    def test_transform_llm_output_audit_error_appends_alert(self):
+        class MockLLM:
+            def complete(self, **kw):
+                raise RuntimeError("LLM connection timeout")
+        class MockCtx:
+            llm = MockLLM()
+
+        rt = runtime_mod.AdvisorRuntime(MockCtx())
+        rt.record_tool_call(tool_name="terminal", args={"command": "ls"}, result="out", session_id="s_err")
+        res = rt.on_transform_llm_output(response_text="done", session_id="s_err")
+        self.assertIsNotNone(res)
+        self.assertIn("Verification Alert", res)
+        self.assertIn("Advisor evaluation failed", res)
+
 
 if __name__ == "__main__":
     unittest.main()
