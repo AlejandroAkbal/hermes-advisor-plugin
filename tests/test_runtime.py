@@ -16,6 +16,7 @@ runtime_mod = sys.modules["hermes_plugins.advisor.runtime"]
 
 _is_substantive_turn = runtime_mod._is_substantive_turn
 _find_guidelines = runtime_mod._find_guidelines
+_get_git_diff = getattr(runtime_mod, "_get_git_diff", None)
 
 
 class TestAdvisorRuntime(unittest.TestCase):
@@ -223,6 +224,279 @@ class TestAdvisorRuntime(unittest.TestCase):
         # Clean response must yield 0 advice items
         self.assertEqual(state.parse_response("nothing to flag"), [])
         self.assertEqual(state.parse_response("Nothing to flag."), [])
+
+    def test_pre_verify_nudge_on_issue(self):
+        class MockLLMResult:
+            def __init__(self, text):
+                self.text = text
+
+        class MockCtx:
+            class MockLLM:
+                def complete(self, **kwargs):
+                    return MockLLMResult("[CONCERN] Unhandled edge case in auth.")
+            llm = MockLLM()
+
+        rt = runtime_mod.AdvisorRuntime(MockCtx())
+        # Mock _get_git_diff to return a diff
+        orig_diff = runtime_mod._get_git_diff
+        try:
+            runtime_mod._get_git_diff = lambda cwd, paths: "diff --git a/foo.py b/foo.py\n+def foo(): pass"
+            res = rt.on_pre_verify(
+                session_id="test_sess",
+                changed_paths=["foo.py"],
+                attempt=0,
+                final_response="All done."
+            )
+            self.assertIsNotNone(res)
+            self.assertEqual(res.get("action"), "continue")
+            self.assertIn("Advisor caught issue before finish", res.get("message", ""))
+            self.assertIn("Unhandled edge case in auth", res.get("message", ""))
+        finally:
+            runtime_mod._get_git_diff = orig_diff
+
+    def test_pre_verify_allows_on_nothing_to_flag(self):
+        class MockLLMResult:
+            def __init__(self, text):
+                self.text = text
+
+        class MockCtx:
+            class MockLLM:
+                def complete(self, **kwargs):
+                    return MockLLMResult("nothing to flag")
+            llm = MockLLM()
+
+        rt = runtime_mod.AdvisorRuntime(MockCtx())
+        orig_diff = runtime_mod._get_git_diff
+        try:
+            runtime_mod._get_git_diff = lambda cwd, paths: "diff --git a/foo.py b/foo.py\n+def foo(): pass"
+            res = rt.on_pre_verify(
+                session_id="test_sess_clean",
+                changed_paths=["foo.py"],
+                attempt=0,
+                final_response="All done."
+            )
+            # Must allow completion
+            self.assertIsNone(res)
+            # Session must be marked as pre-verified
+            self.assertIn("test_sess_clean", rt._pre_verified_sessions)
+
+            # on_post_llm_call right after must skip background review
+            called = []
+            rt._enqueue_review = lambda delta: called.append(delta)
+            rt.on_post_llm_call(
+                session_id="test_sess_clean",
+                turn_id="turn_1",
+                user_message="build it",
+                assistant_response="done",
+                conversation_history=[{"role": "user", "content": "build it"}]
+            )
+            self.assertEqual(called, [], "post_llm_call must skip review when turn was pre-verified")
+        finally:
+            runtime_mod._get_git_diff = orig_diff
+
+    def test_pre_verify_attempt_cap(self):
+        class MockCtx:
+            pass
+        rt = runtime_mod.AdvisorRuntime(MockCtx())
+        # Attempt 2 or higher must return None immediately
+        res = rt.on_pre_verify(
+            session_id="test_sess",
+            changed_paths=["foo.py"],
+            attempt=2,
+            final_response="Done."
+        )
+        self.assertIsNone(res)
+        # Attempt >= 2 must NOT add to _pre_verified_sessions so post_llm_call can review remaining findings
+        self.assertNotIn("test_sess", rt._pre_verified_sessions)
+
+    def test_git_diff_real_repo_cases(self):
+        import subprocess
+        _get_diff = runtime_mod._get_git_diff
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # 1. Initialize git repo
+            subprocess.run(["git", "init"], cwd=tmpdir, check=True, capture_output=True)
+            
+            # Tracked file
+            f1 = Path(tmpdir) / "app.py"
+            f1.write_text("x = 1\n")
+            subprocess.run(["git", "add", "app.py"], cwd=tmpdir, check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=tmpdir, check=True, capture_output=True)
+            f1.write_text("x = 2\n")
+            
+            # Untracked new file
+            f2 = Path(tmpdir) / "helper.py"
+            f2.write_text("def helper(): pass\n")
+            
+            # .github/ workflow file (must NOT be skipped by .git check)
+            gh_dir = Path(tmpdir) / ".github" / "workflows"
+            gh_dir.mkdir(parents=True)
+            f3 = gh_dir / "ci.yml"
+            f3.write_text("name: Test CI\n")
+            
+            # Deleted file
+            f4 = Path(tmpdir) / "obsolete.py"
+            f4.write_text("remove me\n")
+            subprocess.run(["git", "add", "obsolete.py"], cwd=tmpdir, check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "add obsolete"], cwd=tmpdir, check=True, capture_output=True)
+            f4.unlink()
+            
+            diff_out = _get_diff(tmpdir, ["app.py", "helper.py", ".github/workflows/ci.yml", "obsolete.py"])
+            self.assertIsNotNone(diff_out)
+            self.assertIn("x = 2", diff_out, "Tracked change must appear in diff")
+            self.assertIn("def helper(): pass", diff_out, "Untracked new file must appear in diff")
+            self.assertIn("name: Test CI", diff_out, ".github/ workflow file must appear in diff")
+
+    def test_verify_turn_approved(self):
+        class MockLLMResult:
+            text = '{"status": "approved", "reason": "All claims backed by tool output"}'
+
+        class MockCtx:
+            class MockLLM:
+                def complete(self, **kwargs):
+                    return MockLLMResult()
+            llm = MockLLM()
+
+        rt = runtime_mod.AdvisorRuntime(MockCtx())
+        # Record a tool event
+        rt.record_tool_call(tool_name="terminal", args={"command": "rm -rf /tmp/test"}, result="deleted", session_id="sess_1")
+        res = rt.verify_turn(claims=["deleted test directory"], session_id="sess_1")
+        self.assertEqual(res.get("status"), "approved")
+        self.assertTrue(rt._turn_verified.get("sess_1"))
+
+        # on_pre_verify must immediately allow when turn was approved
+        pre_res = rt.on_pre_verify(session_id="sess_1", changed_paths=["foo.py"], attempt=0)
+        self.assertIsNone(pre_res, "Pre-verify must immediately allow completion when verify_turn passed")
+
+    def test_verify_turn_rejected(self):
+        class MockLLMResult:
+            text = '{"status": "rejected", "reason": "No deletion command executed"}'
+
+        class MockCtx:
+            class MockLLM:
+                def complete(self, **kwargs):
+                    return MockLLMResult()
+            llm = MockLLM()
+
+        rt = runtime_mod.AdvisorRuntime(MockCtx())
+        res = rt.verify_turn(claims=["deleted test directory"], session_id="sess_2")
+        self.assertEqual(res.get("status"), "rejected")
+        self.assertFalse(rt._turn_verified.get("sess_2", False))
+
+    def test_tool_buffering_and_pre_llm_call_reset(self):
+        class MockCtx:
+            pass
+        rt = runtime_mod.AdvisorRuntime(MockCtx())
+        # Record tools
+        rt.record_tool_call(tool_name="terminal", args={"command": "ls"}, result="output", session_id="s1")
+        self.assertEqual(len(rt._turn_tool_events.get("s1", [])), 1)
+
+        # pre_llm_call resets buffer and injects context directive
+        ctx_dict = rt.on_pre_llm_call(session_id="s1")
+        self.assertIn("Verification Gate", ctx_dict.get("context", ""))
+        self.assertEqual(len(rt._turn_tool_events.get("s1", [])), 0)
+
+    def test_collect_directives_filtering_and_unwrap(self):
+        collect = runtime_mod._collect_directives
+        raw_msgs = [
+            "first task",
+            "[CONTEXT COMPACTION — REFERENCE ONLY] summary",
+            "[System note: previous turn was interrupted]",
+            "[Verification Gate]: call verify_turn",
+            "◆ Advisor review: concern",
+            "[OUT-OF-BAND USER MESSAGE — steering] how old is this device [/OUT-OF-BAND USER MESSAGE]",
+            "[OUT-OF-BAND USER MESSAGE — empty] [/OUT-OF-BAND USER MESSAGE]",
+            "...",
+            "real user preference"
+        ]
+        res = collect(raw_msgs)
+        self.assertIn("first task", res)
+        self.assertIn("how old is this device", res)
+        self.assertIn("real user preference", res)
+        # Ensure scaffolding is filtered out
+        for d in res:
+            self.assertFalse(d.startswith("[CONTEXT COMPACTION"))
+            self.assertFalse(d.startswith("[System note:"))
+            self.assertFalse(d.startswith("[Verification"))
+            self.assertFalse(d.startswith("◆ Advisor review"))
+            self.assertFalse(d == "...")
+
+    def test_secret_redaction(self):
+        redact = getattr(runtime_mod, "_redact_secrets", lambda s: s)
+        sample = "sk-abcdef1234567890abcdef123456 ghp_123456789012345678901234567890123456 Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+        cleaned = redact(sample)
+        self.assertNotIn("sk-abcdef", cleaned)
+        self.assertNotIn("ghp_123456", cleaned)
+        self.assertNotIn("eyJhbGci", cleaned)
+        self.assertIn("[REDACTED SECRET]", cleaned)
+
+    def test_transform_llm_output_no_tools_returns_none(self):
+        class MockCtx:
+            pass
+        rt = runtime_mod.AdvisorRuntime(MockCtx())
+        res = rt.on_transform_llm_output(response_text="Hello world", session_id="s_clean")
+        self.assertIsNone(res)
+
+    def test_transform_llm_output_already_verified_returns_none(self):
+        class MockCtx:
+            pass
+        rt = runtime_mod.AdvisorRuntime(MockCtx())
+        rt.record_tool_call(tool_name="terminal", args={"command": "ls"}, result="ok", session_id="s_v")
+        rt._turn_verified["s_v"] = True
+        res = rt.on_transform_llm_output(response_text="Hello world", session_id="s_v")
+        self.assertIsNone(res)
+
+    def test_transform_llm_output_catches_unverified_turn(self):
+        class MockLLMResult:
+            text = '{"status": "rejected", "reason": "Claim contradicted by tool output."}'
+        class MockLLM:
+            def complete(self, **kw):
+                return MockLLMResult()
+        class MockCtx:
+            llm = MockLLM()
+
+        rt = runtime_mod.AdvisorRuntime(MockCtx())
+        rt.record_tool_call(tool_name="terminal", args={"command": "rm -rf foo"}, result="Permission denied", session_id="s_unv")
+        res = rt.on_transform_llm_output(response_text="I deleted foo successfully.", session_id="s_unv")
+        self.assertIsNotNone(res)
+        self.assertIn("Verification Alert", res)
+        self.assertIn("Claim contradicted by tool output", res)
+
+    def test_transform_llm_output_approves_unverified_turn_cleanly(self):
+        class MockLLMResult:
+            text = '{"status": "approved", "reason": "Draft is accurate."}'
+        class MockLLM:
+            def complete(self, **kw):
+                return MockLLMResult()
+        class MockCtx:
+            llm = MockLLM()
+
+        rt = runtime_mod.AdvisorRuntime(MockCtx())
+        rt.record_tool_call(tool_name="terminal", args={"command": "ls"}, result="file1.txt", session_id="s_ok")
+        res = rt.on_transform_llm_output(response_text="file1.txt was found.", session_id="s_ok")
+        self.assertIsNone(res)
+
+    def test_transform_llm_output_disabled_returns_none(self):
+        class MockCtx:
+            pass
+        rt = runtime_mod.AdvisorRuntime(MockCtx())
+        rt.state.enabled = False
+        rt.record_tool_call(tool_name="terminal", args={"command": "ls"}, result="out", session_id="s_dis")
+        res = rt.on_transform_llm_output(response_text="done", session_id="s_dis")
+        self.assertIsNone(res)
+
+    def test_transform_llm_output_audit_error_appends_alert(self):
+        class MockLLM:
+            def complete(self, **kw):
+                raise RuntimeError("LLM connection timeout")
+        class MockCtx:
+            llm = MockLLM()
+
+        rt = runtime_mod.AdvisorRuntime(MockCtx())
+        rt.record_tool_call(tool_name="terminal", args={"command": "ls"}, result="out", session_id="s_err")
+        res = rt.on_transform_llm_output(response_text="done", session_id="s_err")
+        self.assertIsNotNone(res)
+        self.assertIn("Verification Alert", res)
+        self.assertIn("Advisor evaluation failed", res)
 
 
 if __name__ == "__main__":

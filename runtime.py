@@ -5,9 +5,11 @@ import json
 import logging
 import os
 import queue
+import re
 import threading
 from contextvars import copy_context
 from pathlib import Path
+from typing import Any
 
 from .advisor_prompt import ADVISOR_SYSTEM_PROMPT
 from .models import AdvisorState, Advice, Severity, TurnDelta
@@ -19,6 +21,25 @@ ADVISOR_NO_REVIEW = "ADVISOR_NO_REVIEW"
 WATCHDOG_FILENAME = "WATCHDOG.md"
 REVIEW_TIMEOUT_SECONDS = 90
 SHUTDOWN_GRACE_SECONDS = 1.0
+
+_SECRET_PATTERNS = (
+    re.compile(r"sk-[a-zA-Z0-9_-]{20,}"),
+    re.compile(r"ghp_[a-zA-Z0-9]{36}"),
+    re.compile(r"xoxb-[0-9]{10,13}-[0-9]{10,13}-[a-zA-Z0-9]{24}"),
+    re.compile(r"AIza[0-9A-Za-z_-]{35}"),
+    re.compile(r"Bearer\s+[A-Za-z0-9\-._~+/]{20,}"),
+    re.compile(r"-----BEGIN (?:RSA |EC )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC )?PRIVATE KEY-----"),
+    re.compile(r"(?i)\b(api_key|secret|password|token)\b\s*[:=]\s*['\"]?([A-Za-z0-9_\-]{8,})['\"]?"),
+)
+
+
+def _redact_secrets(text: str) -> str:
+    """Scrub common tokens, keys, and credentials before LLM dispatch."""
+    if not text:
+        return ""
+    for pat in _SECRET_PATTERNS:
+        text = pat.sub("[REDACTED SECRET]", text)
+    return text
 
 
 def _find_guidelines(cwd: str) -> str:
@@ -82,6 +103,103 @@ ANCHOR_CAP = 2000
 SNIPPET_CAP = 600
 
 
+def _get_git_diff(cwd: str, paths: list[str], max_chars: int = 12000) -> str | None:
+    """Run git diff on changed paths safely, including new, untracked, and deleted files."""
+    try:
+        import os
+        import subprocess
+        from pathlib import Path
+
+        diff_chunks = []
+        total_len = 0
+
+        for p in paths:
+            if not p:
+                continue
+            full_path = Path(p) if os.path.isabs(p) else Path(cwd) / p
+            # Skip internal .git directory files, but allow .github/, .gitignore, etc.
+            if ".git" in full_path.parts:
+                continue
+
+            parent_dir = full_path.parent if full_path.parent.exists() else Path(cwd)
+
+            # Resolve git repo root for this specific file
+            res_root = subprocess.run(
+                ["git", "-C", str(parent_dir), "rev-parse", "--show-toplevel"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            raw_repo = res_root.stdout.strip() if res_root.returncode == 0 else None
+            repo_dir = None
+            if raw_repo:
+                repo_path = Path(raw_repo).resolve()
+                plugin_root = Path(__file__).resolve().parent
+                # Ensure the file is actually inside the detected repo, and avoid auditing
+                # the advisor plugin's own repo for unrelated tasks
+                if full_path.resolve().is_relative_to(repo_path):
+                    if repo_path != plugin_root or full_path.resolve().is_relative_to(plugin_root):
+                        repo_dir = raw_repo
+
+            chunk = ""
+            if not full_path.exists():
+                # Handle deleted file
+                if repo_dir:
+                    rel_p = os.path.relpath(full_path, repo_dir)
+                    cmd = ["git", "-C", repo_dir, "diff", "HEAD", "--", rel_p]
+                    res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+                    chunk = res.stdout.strip() if res.returncode == 0 else ""
+                if not chunk:
+                    chunk = f"deleted file: {p}"
+            elif repo_dir:
+                # File exists within a git repo
+                rel_p = os.path.relpath(full_path, repo_dir)
+                res_track = subprocess.run(
+                    ["git", "-C", repo_dir, "ls-files", "--error-unmatch", "--", rel_p],
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
+                )
+                if res_track.returncode == 0:
+                    # Tracked: diff against HEAD (staged + unstaged edits)
+                    cmd = ["git", "-C", repo_dir, "diff", "HEAD", "--", rel_p]
+                    res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+                    chunk = res.stdout.strip() if res.returncode == 0 else ""
+                    if not chunk:
+                        cmd_c = ["git", "-C", repo_dir, "diff", "--", rel_p]
+                        res_c = subprocess.run(cmd_c, capture_output=True, text=True, timeout=5)
+                        chunk = res_c.stdout.strip() if res_c.returncode == 0 else ""
+                else:
+                    # Untracked in repo: diff against /dev/null
+                    cmd = ["git", "-C", repo_dir, "diff", "--no-index", "--", "/dev/null", rel_p]
+                    res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+                    chunk = res.stdout.strip()
+            else:
+                # Outside git repo entirely: diff against /dev/null
+                cmd = ["git", "diff", "--no-index", "--", "/dev/null", str(full_path)]
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+                chunk = res.stdout.strip()
+
+            if chunk:
+                diff_chunks.append(chunk)
+                total_len += len(chunk)
+                if total_len > max_chars:
+                    break
+
+        if not diff_chunks:
+            if paths:
+                logger.warning("Advisor: changed_paths non-empty (%s) but diff was empty in %s", paths, cwd)
+            return None
+
+        full_diff = "\n\n".join(diff_chunks)
+        if len(full_diff) > max_chars:
+            full_diff = full_diff[:4000] + f"\n\n... [diff truncated - {len(full_diff)} chars total] ...\n\n" + full_diff[-6000:]
+        return full_diff
+    except Exception as exc:
+        logger.debug("Advisor git diff failed for %s in %s: %s", paths, cwd, exc)
+        return None
+
+
 def _clip_directive(text: str, cap: int) -> str:
     """Clip a directive preserving both leading context and trailing instructions."""
     text = text.strip()
@@ -105,8 +223,24 @@ def _collect_directives(user_msgs: list[str]) -> list[str]:
     cleaned = []
     for m in user_msgs:
         m_str = (m or "").strip()
-        if not m_str or m_str in {"...", "…"} or m_str.startswith("◆ Advisor review"):
+        if (
+            not m_str
+            or m_str in {"...", "…"}
+            or m_str.startswith("◆ Advisor review")
+            or m_str.startswith("[CONTEXT COMPACTION")
+            or m_str.startswith("[System note:")
+            or m_str.startswith("[Verification")
+        ):
             continue
+        if m_str.startswith("[OUT-OF-BAND USER MESSAGE"):
+            # Unwrap out-of-band message to keep user's actual steering text
+            import re
+            inner = re.sub(r"^\[OUT-OF-BAND USER MESSAGE[^\]]*\]\s*", "", m_str)
+            inner = re.sub(r"\s*\[/OUT-OF-BAND USER MESSAGE\]$", "", inner).strip()
+            if inner:
+                m_str = inner
+            else:
+                continue
         cleaned.append(m_str)
 
     if not cleaned:
@@ -145,6 +279,9 @@ class AdvisorRuntime:
         self._state_lock = threading.RLock()
         self.state = self._load_state()
         self._session_states: dict[str, AdvisorState] = {}
+        self._pre_verified_sessions: dict[str, tuple[str, ...]] = {}
+        self._turn_tool_events: dict[str, list[dict]] = {}
+        self._turn_verified: dict[str, bool] = {}
 
         # Current turn tracking — populated from post_llm_call kwargs
         self.last_turn_key: tuple[str, str] | None = None
@@ -272,56 +409,8 @@ class AdvisorRuntime:
         model: str = "",
         **kwargs,
     ):
-        """Fired at end of each turn (tool-calling loop complete).
-
-        This is the Hermes equivalent of pi's ``turn_end`` hook.
-        """
-        with self._state_lock:
-            if not self.state.enabled:
-                return
-            turn_key = (session_id or "default", turn_id)
-            if turn_id and turn_key == self.last_turn_key:
-                return
-            self.last_turn_key = turn_key
-        if os.environ.get(ADVISOR_NO_REVIEW):
-            return
-
-        if not conversation_history:
-            return
-
-        # Multi-round depth guard: count consecutive advisor injections since last human message
-        depth = _advisor_depth(conversation_history)
-        max_rounds = getattr(self.state, "max_rounds", 2)
-        if depth >= max_rounds:
-            logger.debug(
-                "Advisor: skipping review, reached max consecutive review depth (%d/%d)",
-                depth, max_rounds,
-            )
-            return
-
-        # Activity gate: skip review on trivial conversational turns with no tool calls
-        if not _is_substantive_turn(user_message, assistant_response, conversation_history):
-            return
-
-        logger.debug(
-            "Advisor: turn %s complete, user=%s, model=%s, msgs=%d",
-            turn_id,
-            (user_message or "")[:60],
-            model or "?",
-            len(conversation_history),
-        )
-
-        self._enqueue_review(
-            TurnDelta(
-                session_id=session_id or "default",
-                turn_id=turn_id or "",
-                user_message=user_message or "",
-                assistant_response=assistant_response or "",
-                conversation_history=list(conversation_history),
-                model=model or "",
-                context=copy_context(),
-            )
-        )
+        """Deprecated post-turn injection: disabled in favor of in-turn verify_turn and pre_verify."""
+        return
 
     def _enqueue_review(self, turn: TurnDelta) -> None:
         """Queue the newest completed turn without blocking hook dispatch."""
@@ -515,6 +604,329 @@ class AdvisorRuntime:
         result = self.ctx.llm.complete(**kwargs)
         return result.text.strip()
 
+    def record_tool_call(
+        self, *, tool_name: str = "", args: dict | None = None, result: Any = None, session_id: str = "", **kwargs
+    ) -> None:
+        """Record tool execution for the active turn in a thread-safe buffer."""
+        if tool_name in ("verify_turn", "consult_advisor", "tool_search", "tool_describe"):
+            return
+        sess = session_id or "default"
+        with self._state_lock:
+            if sess not in self._turn_tool_events:
+                self._turn_tool_events[sess] = []
+            res_str = str(result) if result is not None else ""
+            res_str = _redact_secrets(res_str)
+            if len(res_str) > 2000:
+                head_len = 650
+                tail_len = 1350
+                res_str = (
+                    res_str[:head_len]
+                    + f"\n... [truncated {len(res_str) - 2000} chars] ...\n"
+                    + res_str[-tail_len:]
+                )
+            clean_args = {}
+            if args:
+                for k, v in args.items():
+                    clean_args[k] = _redact_secrets(str(v)) if isinstance(v, str) else v
+            self._turn_tool_events[sess].append({
+                "tool": tool_name,
+                "args": clean_args,
+                "result": res_str,
+            })
+
+    def _session_messages(self, session_id: str = "", limit: int = 20) -> list[dict]:
+        """Fetch recent session messages from state.db for rich context."""
+        if not session_id:
+            return []
+        try:
+            import sqlite3
+            from hermes_constants import get_hermes_home
+            db_path = get_hermes_home() / "state.db"
+            if db_path.exists():
+                with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "SELECT role, content FROM messages WHERE session_id = ? AND active = 1 ORDER BY timestamp DESC LIMIT ?",
+                        (session_id, limit),
+                    )
+                    rows = cursor.fetchall()
+                    return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
+        except Exception:
+            pass
+        return []
+
+    def on_pre_llm_call(self, *, session_id: str = "", **kwargs) -> dict:
+        """Inject verification directive into active turn context for all sessions."""
+        sess = session_id or "default"
+        with self._state_lock:
+            self._turn_tool_events[sess] = []
+            self._turn_verified[sess] = False
+
+        return {
+            "context": (
+                "[Verification Gate]: On any turn where you executed tools or performed actions, you must call "
+                "verify_turn(draft=\"<your proposed response or summary of actions>\") before delivering your final answer. "
+                "The auditor evaluates your draft and tool results against the full session history and user constraints."
+            )
+        }
+
+    def verify_turn(
+        self, *, draft: str = "", claims: list[str] | str | None = None, session_id: str = ""
+    ) -> dict:
+        """Audit draft response and tool actions against full session history and constraints."""
+        sess = session_id or "default"
+        with self._state_lock:
+            events = list(self._turn_tool_events.get(sess, []))
+
+        # Directives across the entire session from past human messages
+        directives = self._session_user_directives(session_id)
+        # Recent conversation history
+        history_msgs = self._session_messages(session_id, limit=10)
+
+        # Find the latest user query from history
+        latest_user_query = ""
+        for m in reversed(history_msgs):
+            if m.get("role") == "user":
+                latest_user_query = m.get("content", "")
+                break
+
+        # Check project guidelines
+        cwd = self._session_cwd(session_id) or os.getcwd()
+        guidelines = _find_guidelines(cwd)
+
+        system_prompt = (
+            "You are an objective auditor and senior coworker verifying an AI agent's actions and draft response.\n"
+            "You have access to the full session context: user directives, recent conversation history, and the raw tool execution events of this turn.\n\n"
+            "Evaluate the agent's work against these strict rules:\n"
+            "1. Did the agent take actions or make claims contradicted by the tool outputs? (e.g. claim deleted/verified when output shows error or omission)\n"
+            "2. Did the agent violate any standing user directives or explicit constraints from this session?\n"
+            "3. If the agent's draft and actions are sound, accurate, and faithful to tool results and user constraints, APPROVE.\n"
+            "4. If there is a hallucination, unverified claim, or missed constraint, REJECT and specify the exact fix.\n\n"
+            "Respond in JSON format: {\"status\": \"approved\" | \"rejected\", \"reason\": \"...\"}"
+        )
+
+        user_prompt_parts = []
+        if guidelines:
+            user_prompt_parts.append(f"### Project Guidelines:\n{guidelines}")
+        if directives:
+            user_prompt_parts.append("### User Directives & Constraints (Session Context):\n" + "\n".join(f"- {d}" for d in directives))
+        if latest_user_query:
+            user_prompt_parts.append(f"### Current User Request:\n{latest_user_query}")
+
+        events_formatted = []
+        for i, ev in enumerate(events, 1):
+            events_formatted.append(f"{i}. Tool: {ev['tool']}\n   Args: {ev['args']}\n   Result: {ev['result']}")
+        user_prompt_parts.append("### Tool Execution Events (This Turn):\n" + ("\n\n".join(events_formatted) if events_formatted else "None (no tools called)."))
+
+        if draft:
+            user_prompt_parts.append(f"### Proposed Draft / Actions:\n{draft}")
+        if claims:
+            if isinstance(claims, str):
+                claims = [claims]
+            claims_clean = [str(c).strip() for c in claims if str(c).strip()]
+            if claims_clean:
+                user_prompt_parts.append("### Specific Asserted Claims:\n" + "\n".join(f"- {c}" for c in claims_clean))
+
+        user_prompt = "\n\n".join(user_prompt_parts)
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        try:
+            kwargs = {"messages": messages, "timeout": REVIEW_TIMEOUT_SECONDS}
+            if self.state.model:
+                kwargs["model"] = self.state.model
+            if self.state.provider:
+                kwargs["provider"] = self.state.provider
+            result = self.ctx.llm.complete(**kwargs)
+            raw = (result.text or "").strip()
+            import json, re
+            parsed = None
+            m = re.search(r"\{.*\}", raw, re.DOTALL)
+            if m:
+                try:
+                    parsed = json.loads(m.group(0))
+                except Exception:
+                    pass
+            if not parsed:
+                status = "approved" if "approved" in raw.lower() and "rejected" not in raw.lower() else "rejected"
+                parsed = {"status": status, "reason": raw}
+
+            if parsed.get("status") == "approved":
+                with self._state_lock:
+                    self._turn_verified[sess] = True
+            return parsed
+        except Exception as exc:
+            logger.warning("verify_turn audit failed: %s", exc)
+            return {"status": "error", "reason": f"Advisor evaluation failed: {exc}"}
+
+    def on_transform_llm_output(
+        self,
+        *,
+        response_text: str = "",
+        session_id: str = "",
+        model: str = "",
+        platform: str = "",
+        turn_id: str = "",
+        **kwargs,
+    ) -> str | None:
+        """Enforce verification: if tools ran this turn but verify_turn was skipped, audit before delivery."""
+        if not self.state.enabled or os.environ.get(ADVISOR_NO_REVIEW):
+            return None
+        sess = session_id or "default"
+        with self._state_lock:
+            tools_ran = bool(self._turn_tool_events.get(sess))
+            already_verified = self._turn_verified.get(sess, False)
+
+        if not tools_ran or already_verified:
+            return None
+
+        # Tools were executed, but the agent skipped calling verify_turn!
+        logger.info("Forced verification running via transform_llm_output for session %s", sess)
+        audit = self.verify_turn(draft=response_text, session_id=session_id)
+        if audit.get("status") == "approved":
+            return None  # Verified and clean, deliver response unchanged
+
+        # Auditor flagged discrepancies, omissions, or unverified claims!
+        reason = audit.get("reason", "Discrepancy detected between claims and tool outputs.")
+        return (
+            f"{response_text}\n\n"
+            f"---\n"
+            f"⚠️ **[Verification Alert]** The auditor caught discrepancies in this answer:\n"
+            f"> {reason}"
+        )
+
+    def _session_user_directives(self, session_id: str = "") -> list[str]:
+        """Pull user directives from state.db for the given session."""
+        if not session_id:
+            return []
+        try:
+            import sqlite3
+            from hermes_constants import get_hermes_home
+            db_path = get_hermes_home() / "state.db"
+            if db_path.exists():
+                with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "SELECT content FROM messages WHERE session_id = ? AND role = 'user' AND active = 1 ORDER BY timestamp ASC",
+                        (session_id,)
+                    )
+                    msgs = [r[0] for r in cursor.fetchall() if r[0]]
+                    return _collect_directives(msgs)
+        except Exception:
+            pass
+        return []
+
+    def on_pre_verify(
+        self,
+        *,
+        session_id: str = "",
+        platform: str = "",
+        model: str = "",
+        coding: bool = False,
+        attempt: int = 0,
+        final_response: str = "",
+        changed_paths: list[str] | None = None,
+        **kwargs,
+    ) -> dict[str, str] | None:
+        """In-loop stop gate: audits git diff before the agent finishes/delivers."""
+        with self._state_lock:
+            if not self.state.enabled:
+                return None
+            if self._turn_verified.get(session_id or "default", False):
+                logger.debug("Advisor pre_verify: session %s already approved by verify_turn", session_id)
+                return None
+        if os.environ.get(ADVISOR_NO_REVIEW):
+            return None
+
+        # Cap self-correction nudges to 2 attempts. When capped, turn finishes and
+        # unresolved issues fall back to post_llm_call background review so findings aren't lost.
+        if attempt >= 2:
+            logger.debug(
+                "Advisor pre_verify: reached max nudge attempt (%d >= 2), allowing turn to finish (will review in background)",
+                attempt,
+            )
+            return None
+
+        if not changed_paths:
+            return None
+
+        cwd = self._session_cwd(session_id) or os.getcwd()
+        diff_text = _get_git_diff(cwd, changed_paths)
+        if not diff_text:
+            logger.debug("Advisor pre_verify: empty diff for %s, skipping", changed_paths)
+            return None
+
+        guidelines = _find_guidelines(cwd)
+        directives = self._session_user_directives(session_id)
+
+        prompt_parts = [
+            "You are a senior Staff Software Engineer and Architect performing an in-loop verification gate.",
+            "The coding agent has modified files and is preparing to report completion.",
+            "Review the git diff below against the user's task and project guidelines before the agent is allowed to finish.\n"
+        ]
+        if guidelines:
+            prompt_parts.append(f"### Project Guidelines & Architecture:\n{guidelines}\n")
+        if directives:
+            prompt_parts.append("### User Directives & Constraints (Session Context):\n" + "\n".join(f"- User: {d}" for d in directives) + "\n")
+
+        prompt_parts.append(f"### Modified Files:\n" + "\n".join(f"- {p}" for p in changed_paths) + "\n")
+        prompt_parts.append(f"### Git Diff:\n```diff\n{diff_text}\n```\n")
+        if final_response:
+            clipped_resp = final_response if len(final_response) <= 2000 else final_response[:800] + "\n... [truncated] ...\n" + final_response[-1200:]
+            prompt_parts.append(f"### Agent's Proposed Completion Report:\n{clipped_resp}\n")
+
+        prompt_parts.append(
+            "### Audit Instructions:\n"
+            "- Check: Does this diff introduce bugs, syntax errors, security flaws, broken contracts, or unverified claims?\n"
+            "- Check: Did the agent claim something works without running real tests or checks?\n"
+            "- Check: Does the diff violate any explicit user directive or project guideline?\n"
+            "- If the changes are sound, tested, minimal, and ready to ship, reply EXACTLY: nothing to flag\n"
+            "- If there is a real bug, regression, or missing check, reply with [BLOCKER] or [CONCERN] and the exact fix required.\n"
+        )
+
+        prompt = "\n".join(prompt_parts)
+        messages = [
+            {"role": "system", "content": "You are a Staff Software Engineer acting as a pre-completion verification gate."},
+            {"role": "user", "content": prompt},
+        ]
+
+        kwargs_llm = {"messages": messages, "timeout": REVIEW_TIMEOUT_SECONDS}
+        if self.state.model:
+            kwargs_llm["model"] = self.state.model
+        if self.state.provider:
+            kwargs_llm["provider"] = self.state.provider
+
+        try:
+            result = self.ctx.llm.complete(**kwargs_llm)
+            review_text = (result.text or "").strip()
+        except Exception as exc:
+            logger.warning("Advisor pre_verify LLM call failed: %s", exc)
+            return None
+
+        if not review_text or review_text.lower().startswith("nothing to flag"):
+            logger.info("Advisor pre_verify: diff approved ('nothing to flag')")
+            with self._state_lock:
+                self._pre_verified_sessions[session_id or "default"] = tuple(sorted(changed_paths))
+            return None
+
+        if "[BLOCKER]" in review_text or "[CONCERN]" in review_text:
+            logger.info("Advisor pre_verify: caught issue, nudging agent (attempt %d/2)", attempt + 1)
+            return {
+                "action": "continue",
+                "message": (
+                    f"Advisor caught issue before finish (attempt {attempt + 1}/2):\n"
+                    f"{review_text}\n"
+                    f"Fix this issue and verify before reporting completion."
+                ),
+            }
+
+        with self._state_lock:
+            self._pre_verified_sessions[session_id or "default"] = tuple(sorted(changed_paths))
+        return None
+
     def _build_review_prompt(
         self,
         *,
@@ -691,7 +1103,13 @@ class AdvisorRuntime:
             lines.append(f"{a.tag()} {a.note}")
 
         advisory_text = "\n".join(lines)
-        full_msg = f"\u25c6 Advisor review\n\n{advisory_text}"
+        full_msg = (
+            f"◆ Advisor review (automated reviewer, NOT the user)\n\n"
+            f"{advisory_text}\n\n"
+            f"[Directive: This message was generated by an automated background reviewer, NOT the user. "
+            f"First answer the user's most recent actual message (the one before this review). "
+            f"Apply any technical fixes above secondarily and briefly. Never attribute this review to the user.]"
+        )
 
         ok = self.ctx.inject_message(full_msg, role="user", session_key=session_id or None)
         if ok:

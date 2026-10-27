@@ -42,14 +42,57 @@ CONSULT_ADVISOR_SCHEMA = {
     },
 }
 
+VERIFY_TURN_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "verify_turn",
+        "description": (
+            "Verify your actions, findings, and proposed answer with the auditor before presenting your final reply to the user. "
+            "Pass your draft answer or summary of actions. The auditor checks your work against the full session history, "
+            "user constraints, and actual tool outputs before approving."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "draft": {
+                    "type": "string",
+                    "description": "Your proposed final response or summary of actions taken.",
+                },
+                "claims": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional specific factual assertions to audit.",
+                },
+            },
+        },
+    },
+}
 
-def _handle_consult_advisor(task: str, proposed_approach: str = "", **kwargs) -> str:
+
+def _handle_consult_advisor(args: dict | None = None, **kwargs) -> str:
     """Tool handler: runs on-demand advisor consultation."""
     runtime = _get_runtime()
     if runtime is None:
         return "Advisor plugin not initialized."
+    args = args or {}
+    task = args.get("task", "")
+    proposed_approach = args.get("proposed_approach", "")
     session_id = kwargs.get("session_id", "")
     return runtime.consult_advisor(task=task, proposed_approach=proposed_approach, session_id=session_id)
+
+
+def _handle_verify_turn(args: dict | None = None, **kwargs) -> str:
+    """Tool handler: audits turn claims and draft against recorded tool outputs and session history."""
+    import json
+    runtime = _get_runtime()
+    if runtime is None:
+        return json.dumps({"status": "error", "reason": "Advisor plugin not initialized."})
+    args = args or {}
+    draft = args.get("draft", "")
+    claims = args.get("claims", [])
+    session_id = kwargs.get("session_id", "")
+    res = runtime.verify_turn(draft=draft, claims=claims, session_id=session_id)
+    return json.dumps(res) if isinstance(res, dict) else str(res)
 
 
 def register(ctx):
@@ -67,10 +110,21 @@ def register(ctx):
         emoji="🧠",
     )
 
-    # Register the post_llm_call hook — fires once per turn at completion.
-    # Kwargs include: turn_id, user_message, assistant_response,
-    # conversation_history, model, session_id, task_id, platform.
-    ctx.register_hook("post_llm_call", _on_post_llm_call)
+    # Register verify_turn tool for in-turn factual and evidence auditing
+    ctx.register_tool(
+        name="verify_turn",
+        toolset="advisor",
+        schema=VERIFY_TURN_SCHEMA,
+        handler=_handle_verify_turn,
+        description="Verify factual claims against tool outputs before answering.",
+        emoji="✅",
+    )
+
+    # Register hooks
+    ctx.register_hook("pre_llm_call", _on_pre_llm_call)
+    ctx.register_hook("post_tool_call", _on_post_tool_call)
+    ctx.register_hook("pre_verify", _on_pre_verify)
+    ctx.register_hook("transform_llm_output", _on_transform_llm_output)
     ctx.register_hook("on_session_finalize", _on_session_finalize)
 
     # Register the /advisor slash command
@@ -97,12 +151,35 @@ def register(ctx):
                 "enabled" if _runtime.state.enabled else "disabled")
 
 
-def _on_post_llm_call(**kwargs):
-    """Hook: fires after each completed agent turn."""
+def _on_pre_llm_call(**kwargs) -> dict:
+    """Hook: injects verification directive into active turn context."""
     runtime = _get_runtime()
     if runtime is None:
-        return
-    runtime.on_post_llm_call(**kwargs)
+        return {}
+    return runtime.on_pre_llm_call(**kwargs)
+
+
+def _on_post_tool_call(**kwargs):
+    """Hook: buffers tool execution events for in-turn verification."""
+    runtime = _get_runtime()
+    if runtime is not None:
+        runtime.record_tool_call(**kwargs)
+
+
+def _on_pre_verify(**kwargs):
+    """Hook: in-loop verification gate after file edits before completion."""
+    runtime = _get_runtime()
+    if runtime is None:
+        return None
+    return runtime.on_pre_verify(**kwargs)
+
+
+def _on_transform_llm_output(**kwargs) -> str | None:
+    """Hook: enforces verification on final response before delivery."""
+    runtime = _get_runtime()
+    if runtime is None:
+        return None
+    return runtime.on_transform_llm_output(**kwargs)
 
 
 def _on_session_finalize(**kwargs):
