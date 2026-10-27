@@ -47,20 +47,23 @@ VERIFY_TURN_SCHEMA = {
     "function": {
         "name": "verify_turn",
         "description": (
-            "Verify this turn's actions and factual claims with the auditor before presenting your final answer. "
-            "Pass the concrete factual assertions you are making (e.g. ['deleted files in scratch', 'HA device toggled on', 'checked 42 items']). "
-            "The auditor validates them against your actual tool outputs from this turn."
+            "Verify your actions, findings, and proposed answer with the auditor before presenting your final reply to the user. "
+            "Pass your draft answer or summary of actions. The auditor checks your work against the full session history, "
+            "user constraints, and actual tool outputs before approving."
         ),
         "parameters": {
             "type": "object",
             "properties": {
+                "draft": {
+                    "type": "string",
+                    "description": "Your proposed final response or summary of actions taken.",
+                },
                 "claims": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Factual claims to verify against this turn's tool outputs.",
+                    "description": "Optional specific factual assertions to audit.",
                 },
             },
-            "required": ["claims"],
         },
     },
 }
@@ -79,15 +82,16 @@ def _handle_consult_advisor(args: dict | None = None, **kwargs) -> str:
 
 
 def _handle_verify_turn(args: dict | None = None, **kwargs) -> str:
-    """Tool handler: audits turn claims against recorded tool outputs."""
+    """Tool handler: audits turn claims and draft against recorded tool outputs and session history."""
     import json
     runtime = _get_runtime()
     if runtime is None:
         return json.dumps({"status": "error", "reason": "Advisor plugin not initialized."})
     args = args or {}
+    draft = args.get("draft", "")
     claims = args.get("claims", [])
     session_id = kwargs.get("session_id", "")
-    res = runtime.verify_turn(claims=claims or [], session_id=session_id)
+    res = runtime.verify_turn(draft=draft, claims=claims, session_id=session_id)
     return json.dumps(res) if isinstance(res, dict) else str(res)
 
 

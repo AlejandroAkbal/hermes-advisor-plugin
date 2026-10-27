@@ -392,7 +392,7 @@ class TestAdvisorRuntime(unittest.TestCase):
 
         # pre_llm_call resets buffer and injects context directive
         ctx_dict = rt.on_pre_llm_call(session_id="s1")
-        self.assertIn("Verification Protocol", ctx_dict.get("context", ""))
+        self.assertIn("Verification Gate", ctx_dict.get("context", ""))
         self.assertEqual(len(rt._turn_tool_events.get("s1", [])), 0)
 
 

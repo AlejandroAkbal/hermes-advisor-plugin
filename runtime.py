@@ -587,6 +587,27 @@ class AdvisorRuntime:
                 "result": res_str,
             })
 
+    def _session_messages(self, session_id: str = "", limit: int = 20) -> list[dict]:
+        """Fetch recent session messages from state.db for rich context."""
+        if not session_id:
+            return []
+        try:
+            import sqlite3
+            from hermes_constants import get_hermes_home
+            db_path = get_hermes_home() / "state.db"
+            if db_path.exists():
+                with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "SELECT role, content FROM messages WHERE session_id = ? AND active = 1 ORDER BY timestamp DESC LIMIT ?",
+                        (session_id, limit),
+                    )
+                    rows = cursor.fetchall()
+                    return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
+        except Exception:
+            pass
+        return []
+
     def on_pre_llm_call(self, *, session_id: str = "", **kwargs) -> dict:
         """Inject verification directive into active turn context for all sessions."""
         sess = session_id or "default"
@@ -596,43 +617,70 @@ class AdvisorRuntime:
 
         return {
             "context": (
-                "[Verification Protocol]: On any task where you performed actions or executed tools, "
-                "you must call verify_turn(claims=[...]) with your concrete factual claims before delivering your final answer. "
-                "The auditor verifies them against your tool outputs."
+                "[Verification Gate]: On any turn where you executed tools or performed actions, you must call "
+                "verify_turn(draft=\"<your proposed response or summary of actions>\") before delivering your final answer. "
+                "The auditor evaluates your draft and tool results against the full session history and user constraints."
             )
         }
 
-    def verify_turn(self, *, claims: list[str] | str, session_id: str = "") -> dict:
-        """Audit factual claims against this turn's recorded tool outputs."""
+    def verify_turn(
+        self, *, draft: str = "", claims: list[str] | str | None = None, session_id: str = ""
+    ) -> dict:
+        """Audit draft response and tool actions against full session history and constraints."""
         sess = session_id or "default"
         with self._state_lock:
             events = list(self._turn_tool_events.get(sess, []))
 
-        if isinstance(claims, str):
-            claims = [claims]
-        claims = [str(c).strip() for c in claims if str(c).strip()]
+        # Directives across the entire session from past human messages
+        directives = self._session_user_directives(session_id)
+        # Recent conversation history
+        history_msgs = self._session_messages(session_id, limit=10)
 
-        if not claims:
-            return {"status": "rejected", "reason": "No claims provided to verify."}
+        # Find the latest user query from history
+        latest_user_query = ""
+        for m in reversed(history_msgs):
+            if m.get("role") == "user":
+                latest_user_query = m.get("content", "")
+                break
+
+        # Check project guidelines
+        cwd = self._session_cwd(session_id) or os.getcwd()
+        guidelines = _find_guidelines(cwd)
 
         system_prompt = (
-            "You are an objective auditor verifying an AI agent's claims against its actual tool execution events.\n"
-            "Compare each asserted claim against the recorded tool calls and outputs.\n"
-            "Rules:\n"
-            "1. If a claim asserts an action was done (e.g. deleted files, toggled HA device, updated config) but no tool output shows it, REJECT.\n"
-            "2. If a claim makes factual assertions contradicted by tool output, REJECT.\n"
-            "3. If tool output explicitly substantiates all claims, APPROVE.\n"
+            "You are an objective auditor and senior coworker verifying an AI agent's actions and draft response.\n"
+            "You have access to the full session context: user directives, recent conversation history, and the raw tool execution events of this turn.\n\n"
+            "Evaluate the agent's work against these strict rules:\n"
+            "1. Did the agent take actions or make claims contradicted by the tool outputs? (e.g. claim deleted/verified when output shows error or omission)\n"
+            "2. Did the agent violate any standing user directives or explicit constraints from this session?\n"
+            "3. If the agent's draft and actions are sound, accurate, and faithful to tool results and user constraints, APPROVE.\n"
+            "4. If there is a hallucination, unverified claim, or missed constraint, REJECT and specify the exact fix.\n\n"
             "Respond in JSON format: {\"status\": \"approved\" | \"rejected\", \"reason\": \"...\"}"
         )
+
+        user_prompt_parts = []
+        if guidelines:
+            user_prompt_parts.append(f"### Project Guidelines:\n{guidelines}")
+        if directives:
+            user_prompt_parts.append("### User Directives & Constraints (Session Context):\n" + "\n".join(f"- {d}" for d in directives))
+        if latest_user_query:
+            user_prompt_parts.append(f"### Current User Request:\n{latest_user_query}")
 
         events_formatted = []
         for i, ev in enumerate(events, 1):
             events_formatted.append(f"{i}. Tool: {ev['tool']}\n   Args: {ev['args']}\n   Result: {ev['result']}")
+        user_prompt_parts.append("### Tool Execution Events (This Turn):\n" + ("\n\n".join(events_formatted) if events_formatted else "None (no tools called)."))
 
-        user_prompt = (
-            "### Asserted Claims:\n" + "\n".join(f"- {c}" for c in claims) + "\n\n"
-            "### Tool Execution Events (This Turn):\n" + ("\n\n".join(events_formatted) if events_formatted else "None (no tools called).")
-        )
+        if draft:
+            user_prompt_parts.append(f"### Proposed Draft / Actions:\n{draft}")
+        if claims:
+            if isinstance(claims, str):
+                claims = [claims]
+            claims_clean = [str(c).strip() for c in claims if str(c).strip()]
+            if claims_clean:
+                user_prompt_parts.append("### Specific Asserted Claims:\n" + "\n".join(f"- {c}" for c in claims_clean))
+
+        user_prompt = "\n\n".join(user_prompt_parts)
 
         messages = [
             {"role": "system", "content": system_prompt},
@@ -646,7 +694,7 @@ class AdvisorRuntime:
             if self.state.provider:
                 kwargs["provider"] = self.state.provider
             result = self.ctx.llm.complete(**kwargs)
-            raw = result.text.strip()
+            raw = (result.text or "").strip()
             import json, re
             parsed = None
             m = re.search(r"\{.*\}", raw, re.DOTALL)
