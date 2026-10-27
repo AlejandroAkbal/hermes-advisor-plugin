@@ -496,10 +496,12 @@ class TestAdvisorRuntime(unittest.TestCase):
 
     def test_redact_secrets_obj_recursive(self):
         redact_obj = getattr(runtime_mod, "_redact_secrets_obj", lambda x: x)
+        dummy_sk = "sk-" + "a" * 24
+        dummy_ghp = "ghp_" + "b" * 36
         nested = {
             "auth": {
-                "token": "sk-1234567890abcdef12345678",
-                "list": ["ghp_123456789012345678901234567890123456", "safe_val"]
+                "token": dummy_sk,
+                "list": [dummy_ghp, "safe_val"]
             }
         }
         cleaned = redact_obj(nested)
@@ -517,6 +519,7 @@ class TestAdvisorRuntime(unittest.TestCase):
         self.assertEqual(res.get("status"), "approved")
 
     def test_verify_turn_status_normalization(self):
+        import os
         class MockLLMResult:
             text = '{"status": "  Approved  ", "reason": "Looks good"}'
         class MockLLM:
@@ -526,9 +529,15 @@ class TestAdvisorRuntime(unittest.TestCase):
             llm = MockLLM()
 
         rt = runtime_mod.AdvisorRuntime(MockCtx())
-        res = rt.verify_turn(draft="testing normalization", session_id="s_norm")
-        self.assertEqual(res.get("status"), "approved")
-        self.assertTrue(rt._turn_verified.get("s_norm", False))
+        rt.state.enabled = True
+        orig_no_review = os.environ.pop(runtime_mod.ADVISOR_NO_REVIEW, None)
+        try:
+            res = rt.verify_turn(draft="testing normalization", session_id="s_norm")
+            self.assertEqual(res.get("status"), "approved")
+            self.assertTrue(rt._turn_verified.get("s_norm", False))
+        finally:
+            if orig_no_review is not None:
+                os.environ[runtime_mod.ADVISOR_NO_REVIEW] = orig_no_review
 
 
 if __name__ == "__main__":
