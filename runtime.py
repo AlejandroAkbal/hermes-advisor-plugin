@@ -602,11 +602,15 @@ class AdvisorRuntime:
             )
         }
 
-    def verify_turn(self, *, claims: list[str], session_id: str = "") -> dict:
+    def verify_turn(self, *, claims: list[str] | str, session_id: str = "") -> dict:
         """Audit factual claims against this turn's recorded tool outputs."""
         sess = session_id or "default"
         with self._state_lock:
             events = list(self._turn_tool_events.get(sess, []))
+
+        if isinstance(claims, str):
+            claims = [claims]
+        claims = [str(c).strip() for c in claims if str(c).strip()]
 
         if not claims:
             return {"status": "rejected", "reason": "No claims provided to verify."}

@@ -66,21 +66,26 @@ VERIFY_TURN_SCHEMA = {
 }
 
 
-def _handle_consult_advisor(task: str, proposed_approach: str = "", **kwargs) -> str:
+def _handle_consult_advisor(args: dict | None = None, **kwargs) -> str:
     """Tool handler: runs on-demand advisor consultation."""
     runtime = _get_runtime()
     if runtime is None:
         return "Advisor plugin not initialized."
+    args = args or {}
+    task = args.get("task", "")
+    proposed_approach = args.get("proposed_approach", "")
     session_id = kwargs.get("session_id", "")
     return runtime.consult_advisor(task=task, proposed_approach=proposed_approach, session_id=session_id)
 
 
-def _handle_verify_turn(claims: list[str] | None = None, **kwargs) -> str:
+def _handle_verify_turn(args: dict | None = None, **kwargs) -> str:
     """Tool handler: audits turn claims against recorded tool outputs."""
     import json
     runtime = _get_runtime()
     if runtime is None:
         return json.dumps({"status": "error", "reason": "Advisor plugin not initialized."})
+    args = args or {}
+    claims = args.get("claims", [])
     session_id = kwargs.get("session_id", "")
     res = runtime.verify_turn(claims=claims or [], session_id=session_id)
     return json.dumps(res) if isinstance(res, dict) else str(res)
