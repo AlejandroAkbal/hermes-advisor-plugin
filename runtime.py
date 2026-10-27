@@ -83,29 +83,58 @@ SNIPPET_CAP = 600
 
 
 def _get_git_diff(cwd: str, paths: list[str], max_chars: int = 12000) -> str | None:
-    """Run git diff on the changed paths safely with a timeout."""
+    """Run git diff on changed paths safely, including new and untracked files."""
     try:
+        import os
         import subprocess
+        from pathlib import Path
 
-        clean_paths = [p for p in paths if p and not p.startswith(".git")]
-        if not clean_paths:
+        diff_chunks = []
+        total_len = 0
+
+        for p in paths:
+            if not p or ".git" in p:
+                continue
+            full_path = Path(p) if os.path.isabs(p) else Path(cwd) / p
+            if not full_path.exists():
+                continue
+
+            # Check if tracked by git
+            res_track = subprocess.run(
+                ["git", "ls-files", "--error-unmatch", str(p)],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            if res_track.returncode == 0:
+                # Tracked: diff against HEAD or working tree
+                cmd = ["git", "diff", "HEAD", "--", str(p)]
+                res = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=5)
+                chunk = res.stdout.strip() if res.returncode == 0 else ""
+                if not chunk:
+                    cmd_c = ["git", "diff", "--", str(p)]
+                    res_c = subprocess.run(cmd_c, cwd=cwd, capture_output=True, text=True, timeout=5)
+                    chunk = res_c.stdout.strip() if res_c.returncode == 0 else ""
+            else:
+                # Untracked/new file: diff against /dev/null (exit 1 is normal for non-empty diff)
+                cmd = ["git", "diff", "--no-index", "/dev/null", str(full_path)]
+                res = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=5)
+                chunk = res.stdout.strip()
+
+            if chunk:
+                diff_chunks.append(chunk)
+                total_len += len(chunk)
+                if total_len > max_chars:
+                    break
+
+        if not diff_chunks:
             return None
 
-        cmd = ["git", "diff", "--"] + clean_paths
-        res = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=5)
-        out = res.stdout.strip() if res.returncode == 0 else ""
-
-        if not out:
-            cmd_staged = ["git", "diff", "--cached", "--"] + clean_paths
-            res_staged = subprocess.run(cmd_staged, cwd=cwd, capture_output=True, text=True, timeout=5)
-            out = res_staged.stdout.strip() if res_staged.returncode == 0 else ""
-
-        if not out:
-            return None
-
-        if len(out) > max_chars:
-            out = out[:4000] + f"\n\n... [diff truncated - {len(out)} chars total] ...\n\n" + out[-6000:]
-        return out
+        full_diff = "\n\n".join(diff_chunks)
+        if len(full_diff) > max_chars:
+            full_diff = full_diff[:4000] + f"\n\n... [diff truncated - {len(full_diff)} chars total] ...\n\n" + full_diff[-6000:]
+        return full_diff
     except Exception as exc:
         logger.debug("Advisor git diff failed for %s in %s: %s", paths, cwd, exc)
         return None
