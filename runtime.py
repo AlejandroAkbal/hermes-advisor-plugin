@@ -203,8 +203,24 @@ def _collect_directives(user_msgs: list[str]) -> list[str]:
     cleaned = []
     for m in user_msgs:
         m_str = (m or "").strip()
-        if not m_str or m_str in {"...", "…"} or m_str.startswith("◆ Advisor review"):
+        if (
+            not m_str
+            or m_str in {"...", "…"}
+            or m_str.startswith("◆ Advisor review")
+            or m_str.startswith("[CONTEXT COMPACTION")
+            or m_str.startswith("[System note:")
+            or m_str.startswith("[Verification")
+        ):
             continue
+        if m_str.startswith("[OUT-OF-BAND USER MESSAGE"):
+            # Unwrap out-of-band message to keep user's actual steering text
+            import re
+            inner = re.sub(r"^\[OUT-OF-BAND USER MESSAGE[^\]]*\]\s*", "", m_str)
+            inner = re.sub(r"\s*\[/OUT-OF-BAND USER MESSAGE\]$", "", inner).strip()
+            if inner:
+                m_str = inner
+            else:
+                continue
         cleaned.append(m_str)
 
     if not cleaned:
