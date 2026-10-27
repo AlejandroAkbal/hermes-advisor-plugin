@@ -315,6 +315,8 @@ class TestAdvisorRuntime(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             # 1. Initialize git repo
             subprocess.run(["git", "init"], cwd=tmpdir, check=True, capture_output=True)
+            for k, v in [("user.name", "test"), ("user.email", "test@example.com"), ("commit.gpgsign", "false")]:
+                subprocess.run(["git", "config", k, v], cwd=tmpdir, check=True, capture_output=True)
             
             # Tracked file
             f1 = Path(tmpdir) / "app.py"
@@ -484,7 +486,7 @@ class TestAdvisorRuntime(unittest.TestCase):
         res = rt.on_transform_llm_output(response_text="done", session_id="s_dis")
         self.assertIsNone(res)
 
-    def test_transform_llm_output_audit_error_appends_alert(self):
+    def test_transform_llm_output_audit_error_fails_open(self):
         class MockLLM:
             def complete(self, **kw):
                 raise RuntimeError("LLM connection timeout")
@@ -494,9 +496,15 @@ class TestAdvisorRuntime(unittest.TestCase):
         rt = runtime_mod.AdvisorRuntime(MockCtx())
         rt.record_tool_call(tool_name="terminal", args={"command": "ls"}, result="out", session_id="s_err")
         res = rt.on_transform_llm_output(response_text="done", session_id="s_err")
-        self.assertIsNotNone(res)
-        self.assertIn("Verification Alert", res)
-        self.assertIn("Advisor evaluation failed", res)
+        self.assertIsNone(res)  # Fails open cleanly on error instead of false alert
+
+    def test_record_tool_call_invalidates_prior_turn_approval(self):
+        class MockCtx:
+            pass
+        rt = runtime_mod.AdvisorRuntime(MockCtx())
+        rt._turn_verified["s1"] = True
+        rt.record_tool_call(tool_name="terminal", args={"command": "ls"}, result="ok", session_id="s1")
+        self.assertFalse(rt._turn_verified.get("s1", False))
 
 
 if __name__ == "__main__":
