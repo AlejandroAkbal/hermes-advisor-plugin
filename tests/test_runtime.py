@@ -16,6 +16,7 @@ runtime_mod = sys.modules["hermes_plugins.advisor.runtime"]
 
 _is_substantive_turn = runtime_mod._is_substantive_turn
 _find_guidelines = runtime_mod._find_guidelines
+_get_git_diff = getattr(runtime_mod, "_get_git_diff", None)
 
 
 class TestAdvisorRuntime(unittest.TestCase):
@@ -223,6 +224,88 @@ class TestAdvisorRuntime(unittest.TestCase):
         # Clean response must yield 0 advice items
         self.assertEqual(state.parse_response("nothing to flag"), [])
         self.assertEqual(state.parse_response("Nothing to flag."), [])
+
+    def test_pre_verify_nudge_on_issue(self):
+        class MockLLMResult:
+            def __init__(self, text):
+                self.text = text
+
+        class MockCtx:
+            class MockLLM:
+                def complete(self, **kwargs):
+                    return MockLLMResult("[CONCERN] Unhandled edge case in auth.")
+            llm = MockLLM()
+
+        rt = runtime_mod.AdvisorRuntime(MockCtx())
+        # Mock _get_git_diff to return a diff
+        orig_diff = runtime_mod._get_git_diff
+        try:
+            runtime_mod._get_git_diff = lambda cwd, paths: "diff --git a/foo.py b/foo.py\n+def foo(): pass"
+            res = rt.on_pre_verify(
+                session_id="test_sess",
+                changed_paths=["foo.py"],
+                attempt=0,
+                final_response="All done."
+            )
+            self.assertIsNotNone(res)
+            self.assertEqual(res.get("action"), "continue")
+            self.assertIn("Advisor caught issue before finish", res.get("message", ""))
+            self.assertIn("Unhandled edge case in auth", res.get("message", ""))
+        finally:
+            runtime_mod._get_git_diff = orig_diff
+
+    def test_pre_verify_allows_on_nothing_to_flag(self):
+        class MockLLMResult:
+            def __init__(self, text):
+                self.text = text
+
+        class MockCtx:
+            class MockLLM:
+                def complete(self, **kwargs):
+                    return MockLLMResult("nothing to flag")
+            llm = MockLLM()
+
+        rt = runtime_mod.AdvisorRuntime(MockCtx())
+        orig_diff = runtime_mod._get_git_diff
+        try:
+            runtime_mod._get_git_diff = lambda cwd, paths: "diff --git a/foo.py b/foo.py\n+def foo(): pass"
+            res = rt.on_pre_verify(
+                session_id="test_sess_clean",
+                changed_paths=["foo.py"],
+                attempt=0,
+                final_response="All done."
+            )
+            # Must allow completion
+            self.assertIsNone(res)
+            # Session must be marked as pre-verified
+            self.assertIn("test_sess_clean", rt._pre_verified_sessions)
+
+            # on_post_llm_call right after must skip background review
+            called = []
+            rt._enqueue_review = lambda delta: called.append(delta)
+            rt.on_post_llm_call(
+                session_id="test_sess_clean",
+                turn_id="turn_1",
+                user_message="build it",
+                assistant_response="done",
+                conversation_history=[{"role": "user", "content": "build it"}]
+            )
+            self.assertEqual(called, [], "post_llm_call must skip review when turn was pre-verified")
+        finally:
+            runtime_mod._get_git_diff = orig_diff
+
+    def test_pre_verify_attempt_cap(self):
+        class MockCtx:
+            pass
+        rt = runtime_mod.AdvisorRuntime(MockCtx())
+        # Attempt 2 or higher must return None immediately
+        res = rt.on_pre_verify(
+            session_id="test_sess",
+            changed_paths=["foo.py"],
+            attempt=2,
+            final_response="Done."
+        )
+        self.assertIsNone(res)
 
 
 if __name__ == "__main__":

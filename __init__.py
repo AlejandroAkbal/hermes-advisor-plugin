@@ -67,9 +67,8 @@ def register(ctx):
         emoji="🧠",
     )
 
-    # Register the post_llm_call hook — fires once per turn at completion.
-    # Kwargs include: turn_id, user_message, assistant_response,
-    # conversation_history, model, session_id, task_id, platform.
+    # Register hooks
+    ctx.register_hook("pre_verify", _on_pre_verify)
     ctx.register_hook("post_llm_call", _on_post_llm_call)
     ctx.register_hook("on_session_finalize", _on_session_finalize)
 
@@ -95,6 +94,14 @@ def register(ctx):
 
     logger.info("Advisor plugin registered (state=%s)",
                 "enabled" if _runtime.state.enabled else "disabled")
+
+
+def _on_pre_verify(**kwargs):
+    """Hook: in-loop verification gate after file edits before completion."""
+    runtime = _get_runtime()
+    if runtime is None:
+        return None
+    return runtime.on_pre_verify(**kwargs)
 
 
 def _on_post_llm_call(**kwargs):

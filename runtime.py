@@ -82,6 +82,35 @@ ANCHOR_CAP = 2000
 SNIPPET_CAP = 600
 
 
+def _get_git_diff(cwd: str, paths: list[str], max_chars: int = 12000) -> str | None:
+    """Run git diff on the changed paths safely with a timeout."""
+    try:
+        import subprocess
+
+        clean_paths = [p for p in paths if p and not p.startswith(".git")]
+        if not clean_paths:
+            return None
+
+        cmd = ["git", "diff", "--"] + clean_paths
+        res = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=5)
+        out = res.stdout.strip() if res.returncode == 0 else ""
+
+        if not out:
+            cmd_staged = ["git", "diff", "--cached", "--"] + clean_paths
+            res_staged = subprocess.run(cmd_staged, cwd=cwd, capture_output=True, text=True, timeout=5)
+            out = res_staged.stdout.strip() if res_staged.returncode == 0 else ""
+
+        if not out:
+            return None
+
+        if len(out) > max_chars:
+            out = out[:4000] + f"\n\n... [diff truncated - {len(out)} chars total] ...\n\n" + out[-6000:]
+        return out
+    except Exception as exc:
+        logger.debug("Advisor git diff failed for %s in %s: %s", paths, cwd, exc)
+        return None
+
+
 def _clip_directive(text: str, cap: int) -> str:
     """Clip a directive preserving both leading context and trailing instructions."""
     text = text.strip()
@@ -145,6 +174,7 @@ class AdvisorRuntime:
         self._state_lock = threading.RLock()
         self.state = self._load_state()
         self._session_states: dict[str, AdvisorState] = {}
+        self._pre_verified_sessions: dict[str, tuple[str, ...]] = {}
 
         # Current turn tracking — populated from post_llm_call kwargs
         self.last_turn_key: tuple[str, str] | None = None
@@ -278,6 +308,11 @@ class AdvisorRuntime:
         """
         with self._state_lock:
             if not self.state.enabled:
+                return
+            # Check if this turn was already audited and cleared by in-loop pre_verify
+            if (session_id or "default") in self._pre_verified_sessions:
+                self._pre_verified_sessions.pop(session_id or "default", None)
+                logger.debug("Advisor: skipping post_llm_call review, already audited by pre_verify")
                 return
             turn_key = (session_id or "default", turn_id)
             if turn_id and turn_key == self.last_turn_key:
@@ -514,6 +549,126 @@ class AdvisorRuntime:
 
         result = self.ctx.llm.complete(**kwargs)
         return result.text.strip()
+
+    def _session_user_directives(self, session_id: str = "") -> list[str]:
+        """Pull user directives from state.db for the given session."""
+        if not session_id:
+            return []
+        try:
+            import sqlite3
+            from hermes_constants import get_hermes_home
+            db_path = get_hermes_home() / "state.db"
+            if db_path.exists():
+                with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "SELECT content FROM messages WHERE session_id = ? AND role = 'user' AND active = 1 ORDER BY timestamp ASC",
+                        (session_id,)
+                    )
+                    msgs = [r[0] for r in cursor.fetchall() if r[0]]
+                    return _collect_directives(msgs)
+        except Exception:
+            pass
+        return []
+
+    def on_pre_verify(
+        self,
+        *,
+        session_id: str = "",
+        platform: str = "",
+        model: str = "",
+        coding: bool = False,
+        attempt: int = 0,
+        final_response: str = "",
+        changed_paths: list[str] | None = None,
+        **kwargs,
+    ) -> dict[str, str] | None:
+        """In-loop stop gate: audits git diff before the agent finishes/delivers."""
+        with self._state_lock:
+            if not self.state.enabled:
+                return None
+
+        # Cap self-correction nudges to 2 attempts
+        if attempt >= 2:
+            logger.debug("Advisor pre_verify: reached max nudge attempt (%d >= 2), allowing turn to finish", attempt)
+            return None
+
+        if not changed_paths:
+            return None
+
+        cwd = self._session_cwd(session_id) or os.getcwd()
+        diff_text = _get_git_diff(cwd, changed_paths)
+        if not diff_text:
+            logger.debug("Advisor pre_verify: empty diff for %s, skipping", changed_paths)
+            return None
+
+        guidelines = _find_guidelines(cwd)
+        directives = self._session_user_directives(session_id)
+
+        prompt_parts = [
+            "You are a senior Staff Software Engineer and Architect performing an in-loop verification gate.",
+            "The coding agent has modified files and is preparing to report completion.",
+            "Review the git diff below against the user's task and project guidelines before the agent is allowed to finish.\n"
+        ]
+        if guidelines:
+            prompt_parts.append(f"### Project Guidelines & Architecture:\n{guidelines}\n")
+        if directives:
+            prompt_parts.append("### User Directives & Constraints (Session Context):\n" + "\n".join(f"- User: {d}" for d in directives) + "\n")
+
+        prompt_parts.append(f"### Modified Files:\n" + "\n".join(f"- {p}" for p in changed_paths) + "\n")
+        prompt_parts.append(f"### Git Diff:\n```diff\n{diff_text}\n```\n")
+        if final_response:
+            clipped_resp = final_response if len(final_response) <= 2000 else final_response[:800] + "\n... [truncated] ...\n" + final_response[-1200:]
+            prompt_parts.append(f"### Agent's Proposed Completion Report:\n{clipped_resp}\n")
+
+        prompt_parts.append(
+            "### Audit Instructions:\n"
+            "- Check: Does this diff introduce bugs, syntax errors, security flaws, broken contracts, or unverified claims?\n"
+            "- Check: Did the agent claim something works without running real tests or checks?\n"
+            "- Check: Does the diff violate any explicit user directive or project guideline?\n"
+            "- If the changes are sound, tested, minimal, and ready to ship, reply EXACTLY: nothing to flag\n"
+            "- If there is a real bug, regression, or missing check, reply with [BLOCKER] or [CONCERN] and the exact fix required.\n"
+        )
+
+        prompt = "\n".join(prompt_parts)
+        messages = [
+            {"role": "system", "content": "You are a Staff Software Engineer acting as a pre-completion verification gate."},
+            {"role": "user", "content": prompt},
+        ]
+
+        kwargs_llm = {"messages": messages, "timeout": REVIEW_TIMEOUT_SECONDS}
+        if self.state.model:
+            kwargs_llm["model"] = self.state.model
+        if self.state.provider:
+            kwargs_llm["provider"] = self.state.provider
+
+        try:
+            result = self.ctx.llm.complete(**kwargs_llm)
+            review_text = (result.text or "").strip()
+        except Exception as exc:
+            logger.warning("Advisor pre_verify LLM call failed: %s", exc)
+            return None
+
+        if not review_text or review_text.lower().startswith("nothing to flag"):
+            logger.info("Advisor pre_verify: diff approved ('nothing to flag')")
+            with self._state_lock:
+                self._pre_verified_sessions[session_id or "default"] = tuple(sorted(changed_paths))
+            return None
+
+        if "[BLOCKER]" in review_text or "[CONCERN]" in review_text:
+            logger.info("Advisor pre_verify: caught issue, nudging agent (attempt %d/2)", attempt + 1)
+            return {
+                "action": "continue",
+                "message": (
+                    f"Advisor caught issue before finish (attempt {attempt + 1}/2):\n"
+                    f"{review_text}\n"
+                    f"Fix this issue and verify before reporting completion."
+                ),
+            }
+
+        with self._state_lock:
+            self._pre_verified_sessions[session_id or "default"] = tuple(sorted(changed_paths))
+        return None
 
     def _build_review_prompt(
         self,
