@@ -75,13 +75,15 @@ def _handle_consult_advisor(task: str, proposed_approach: str = "", **kwargs) ->
     return runtime.consult_advisor(task=task, proposed_approach=proposed_approach, session_id=session_id)
 
 
-def _handle_verify_turn(claims: list[str] | None = None, **kwargs) -> dict:
+def _handle_verify_turn(claims: list[str] | None = None, **kwargs) -> str:
     """Tool handler: audits turn claims against recorded tool outputs."""
+    import json
     runtime = _get_runtime()
     if runtime is None:
-        return {"status": "error", "reason": "Advisor plugin not initialized."}
+        return json.dumps({"status": "error", "reason": "Advisor plugin not initialized."})
     session_id = kwargs.get("session_id", "")
-    return runtime.verify_turn(claims=claims or [], session_id=session_id)
+    res = runtime.verify_turn(claims=claims or [], session_id=session_id)
+    return json.dumps(res) if isinstance(res, dict) else str(res)
 
 
 def register(ctx):
