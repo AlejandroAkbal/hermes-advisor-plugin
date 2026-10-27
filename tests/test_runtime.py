@@ -395,6 +395,31 @@ class TestAdvisorRuntime(unittest.TestCase):
         self.assertIn("Verification Gate", ctx_dict.get("context", ""))
         self.assertEqual(len(rt._turn_tool_events.get("s1", [])), 0)
 
+    def test_collect_directives_filtering_and_unwrap(self):
+        collect = runtime_mod._collect_directives
+        raw_msgs = [
+            "first task",
+            "[CONTEXT COMPACTION — REFERENCE ONLY] summary",
+            "[System note: previous turn was interrupted]",
+            "[Verification Gate]: call verify_turn",
+            "◆ Advisor review: concern",
+            "[OUT-OF-BAND USER MESSAGE — steering] how old is this device [/OUT-OF-BAND USER MESSAGE]",
+            "[OUT-OF-BAND USER MESSAGE — empty] [/OUT-OF-BAND USER MESSAGE]",
+            "...",
+            "real user preference"
+        ]
+        res = collect(raw_msgs)
+        self.assertIn("first task", res)
+        self.assertIn("how old is this device", res)
+        self.assertIn("real user preference", res)
+        # Ensure scaffolding is filtered out
+        for d in res:
+            self.assertFalse(d.startswith("[CONTEXT COMPACTION"))
+            self.assertFalse(d.startswith("[System note:"))
+            self.assertFalse(d.startswith("[Verification"))
+            self.assertFalse(d.startswith("◆ Advisor review"))
+            self.assertFalse(d == "...")
+
 
 if __name__ == "__main__":
     unittest.main()
