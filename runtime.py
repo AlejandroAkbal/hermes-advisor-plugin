@@ -8,6 +8,7 @@ import queue
 import threading
 from contextvars import copy_context
 from pathlib import Path
+from typing import Any
 
 from .advisor_prompt import ADVISOR_SYSTEM_PROMPT
 from .models import AdvisorState, Advice, Severity, TurnDelta
@@ -243,6 +244,8 @@ class AdvisorRuntime:
         self.state = self._load_state()
         self._session_states: dict[str, AdvisorState] = {}
         self._pre_verified_sessions: dict[str, tuple[str, ...]] = {}
+        self._turn_tool_events: dict[str, list[dict]] = {}
+        self._turn_verified: dict[str, bool] = {}
 
         # Current turn tracking — populated from post_llm_call kwargs
         self.last_turn_key: tuple[str, str] | None = None
@@ -370,61 +373,8 @@ class AdvisorRuntime:
         model: str = "",
         **kwargs,
     ):
-        """Fired at end of each turn (tool-calling loop complete).
-
-        This is the Hermes equivalent of pi's ``turn_end`` hook.
-        """
-        with self._state_lock:
-            if not self.state.enabled:
-                return
-            # Check if this turn was already audited and cleared by in-loop pre_verify
-            if (session_id or "default") in self._pre_verified_sessions:
-                self._pre_verified_sessions.pop(session_id or "default", None)
-                logger.debug("Advisor: skipping post_llm_call review, already audited by pre_verify")
-                return
-            turn_key = (session_id or "default", turn_id)
-            if turn_id and turn_key == self.last_turn_key:
-                return
-            self.last_turn_key = turn_key
-        if os.environ.get(ADVISOR_NO_REVIEW):
-            return
-
-        if not conversation_history:
-            return
-
-        # Multi-round depth guard: count consecutive advisor injections since last human message
-        depth = _advisor_depth(conversation_history)
-        max_rounds = getattr(self.state, "max_rounds", 2)
-        if depth >= max_rounds:
-            logger.debug(
-                "Advisor: skipping review, reached max consecutive review depth (%d/%d)",
-                depth, max_rounds,
-            )
-            return
-
-        # Activity gate: skip review on trivial conversational turns with no tool calls
-        if not _is_substantive_turn(user_message, assistant_response, conversation_history):
-            return
-
-        logger.debug(
-            "Advisor: turn %s complete, user=%s, model=%s, msgs=%d",
-            turn_id,
-            (user_message or "")[:60],
-            model or "?",
-            len(conversation_history),
-        )
-
-        self._enqueue_review(
-            TurnDelta(
-                session_id=session_id or "default",
-                turn_id=turn_id or "",
-                user_message=user_message or "",
-                assistant_response=assistant_response or "",
-                conversation_history=list(conversation_history),
-                model=model or "",
-                context=copy_context(),
-            )
-        )
+        """Deprecated post-turn injection: disabled in favor of in-turn verify_turn and pre_verify."""
+        return
 
     def _enqueue_review(self, turn: TurnDelta) -> None:
         """Queue the newest completed turn without blocking hook dispatch."""
@@ -618,6 +568,101 @@ class AdvisorRuntime:
         result = self.ctx.llm.complete(**kwargs)
         return result.text.strip()
 
+    def record_tool_call(
+        self, *, tool_name: str = "", args: dict | None = None, result: Any = None, session_id: str = "", **kwargs
+    ) -> None:
+        """Record tool execution for the active turn in a thread-safe buffer."""
+        if tool_name in ("verify_turn", "consult_advisor", "tool_search", "tool_describe"):
+            return
+        sess = session_id or "default"
+        with self._state_lock:
+            if sess not in self._turn_tool_events:
+                self._turn_tool_events[sess] = []
+            res_str = str(result) if result is not None else ""
+            if len(res_str) > 2000:
+                res_str = res_str[:1000] + f"\n... [truncated {len(res_str)} chars] ...\n" + res_str[-1000:]
+            self._turn_tool_events[sess].append({
+                "tool": tool_name,
+                "args": args or {},
+                "result": res_str,
+            })
+
+    def on_pre_llm_call(self, *, session_id: str = "", **kwargs) -> dict:
+        """Inject verification directive into active turn context for all sessions."""
+        sess = session_id or "default"
+        with self._state_lock:
+            self._turn_tool_events[sess] = []
+            self._turn_verified[sess] = False
+
+        return {
+            "context": (
+                "[Verification Protocol]: On any task where you performed actions or executed tools, "
+                "you must call verify_turn(claims=[...]) with your concrete factual claims before delivering your final answer. "
+                "The auditor verifies them against your tool outputs."
+            )
+        }
+
+    def verify_turn(self, *, claims: list[str], session_id: str = "") -> dict:
+        """Audit factual claims against this turn's recorded tool outputs."""
+        sess = session_id or "default"
+        with self._state_lock:
+            events = list(self._turn_tool_events.get(sess, []))
+
+        if not claims:
+            return {"status": "rejected", "reason": "No claims provided to verify."}
+
+        system_prompt = (
+            "You are an objective auditor verifying an AI agent's claims against its actual tool execution events.\n"
+            "Compare each asserted claim against the recorded tool calls and outputs.\n"
+            "Rules:\n"
+            "1. If a claim asserts an action was done (e.g. deleted files, toggled HA device, updated config) but no tool output shows it, REJECT.\n"
+            "2. If a claim makes factual assertions contradicted by tool output, REJECT.\n"
+            "3. If tool output explicitly substantiates all claims, APPROVE.\n"
+            "Respond in JSON format: {\"status\": \"approved\" | \"rejected\", \"reason\": \"...\"}"
+        )
+
+        events_formatted = []
+        for i, ev in enumerate(events, 1):
+            events_formatted.append(f"{i}. Tool: {ev['tool']}\n   Args: {ev['args']}\n   Result: {ev['result']}")
+
+        user_prompt = (
+            "### Asserted Claims:\n" + "\n".join(f"- {c}" for c in claims) + "\n\n"
+            "### Tool Execution Events (This Turn):\n" + ("\n\n".join(events_formatted) if events_formatted else "None (no tools called).")
+        )
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        try:
+            kwargs = {"messages": messages, "timeout": REVIEW_TIMEOUT_SECONDS}
+            if self.state.model:
+                kwargs["model"] = self.state.model
+            if self.state.provider:
+                kwargs["provider"] = self.state.provider
+            result = self.ctx.llm.complete(**kwargs)
+            raw = result.text.strip()
+            import json, re
+            parsed = None
+            m = re.search(r"\{.*\}", raw, re.DOTALL)
+            if m:
+                try:
+                    parsed = json.loads(m.group(0))
+                except Exception:
+                    pass
+            if not parsed:
+                status = "approved" if "approved" in raw.lower() and "rejected" not in raw.lower() else "rejected"
+                parsed = {"status": status, "reason": raw}
+
+            if parsed.get("status") == "approved":
+                with self._state_lock:
+                    self._turn_verified[sess] = True
+            return parsed
+        except Exception as exc:
+            logger.warning("verify_turn audit failed: %s", exc)
+            return {"status": "error", "reason": f"Advisor evaluation failed: {exc}"}
+
     def _session_user_directives(self, session_id: str = "") -> list[str]:
         """Pull user directives from state.db for the given session."""
         if not session_id:
@@ -654,6 +699,9 @@ class AdvisorRuntime:
         """In-loop stop gate: audits git diff before the agent finishes/delivers."""
         with self._state_lock:
             if not self.state.enabled:
+                return None
+            if self._turn_verified.get(session_id or "default", False):
+                logger.debug("Advisor pre_verify: session %s already approved by verify_turn", session_id)
                 return None
         if os.environ.get(ADVISOR_NO_REVIEW):
             return None

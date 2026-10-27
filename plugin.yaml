@@ -1,11 +1,14 @@
 name: advisor
-version: "2.0.0"
-description: "AI Coworker for Hermes: active on-demand architect tool + parallel background oversight."
+version: "2.1.0"
+description: "AI Coworker for Hermes: in-turn verify_turn + architect consultation."
 author: Alejandro Akbal, Ljubomir Josifovski, Petr Baudis
 license: MIT
 requires_hermes: ">=0.21"
 provides_hooks:
-  - post_llm_call
+  - pre_llm_call
+  - post_tool_call
+  - pre_verify
   - on_session_finalize
 provides_tools:
   - consult_advisor
+  - verify_turn

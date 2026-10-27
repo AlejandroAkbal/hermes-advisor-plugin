@@ -42,6 +42,29 @@ CONSULT_ADVISOR_SCHEMA = {
     },
 }
 
+VERIFY_TURN_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "verify_turn",
+        "description": (
+            "Verify this turn's actions and factual claims with the auditor before presenting your final answer. "
+            "Pass the concrete factual assertions you are making (e.g. ['deleted files in scratch', 'HA device toggled on', 'checked 42 items']). "
+            "The auditor validates them against your actual tool outputs from this turn."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "claims": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Factual claims to verify against this turn's tool outputs.",
+                },
+            },
+            "required": ["claims"],
+        },
+    },
+}
+
 
 def _handle_consult_advisor(task: str, proposed_approach: str = "", **kwargs) -> str:
     """Tool handler: runs on-demand advisor consultation."""
@@ -50,6 +73,15 @@ def _handle_consult_advisor(task: str, proposed_approach: str = "", **kwargs) ->
         return "Advisor plugin not initialized."
     session_id = kwargs.get("session_id", "")
     return runtime.consult_advisor(task=task, proposed_approach=proposed_approach, session_id=session_id)
+
+
+def _handle_verify_turn(claims: list[str] | None = None, **kwargs) -> dict:
+    """Tool handler: audits turn claims against recorded tool outputs."""
+    runtime = _get_runtime()
+    if runtime is None:
+        return {"status": "error", "reason": "Advisor plugin not initialized."}
+    session_id = kwargs.get("session_id", "")
+    return runtime.verify_turn(claims=claims or [], session_id=session_id)
 
 
 def register(ctx):
@@ -67,9 +99,20 @@ def register(ctx):
         emoji="🧠",
     )
 
+    # Register verify_turn tool for in-turn factual and evidence auditing
+    ctx.register_tool(
+        name="verify_turn",
+        toolset="advisor",
+        schema=VERIFY_TURN_SCHEMA,
+        handler=_handle_verify_turn,
+        description="Verify factual claims against tool outputs before answering.",
+        emoji="✅",
+    )
+
     # Register hooks
+    ctx.register_hook("pre_llm_call", _on_pre_llm_call)
+    ctx.register_hook("post_tool_call", _on_post_tool_call)
     ctx.register_hook("pre_verify", _on_pre_verify)
-    ctx.register_hook("post_llm_call", _on_post_llm_call)
     ctx.register_hook("on_session_finalize", _on_session_finalize)
 
     # Register the /advisor slash command
@@ -96,20 +139,27 @@ def register(ctx):
                 "enabled" if _runtime.state.enabled else "disabled")
 
 
+def _on_pre_llm_call(**kwargs) -> dict:
+    """Hook: injects verification directive into active turn context."""
+    runtime = _get_runtime()
+    if runtime is None:
+        return {}
+    return runtime.on_pre_llm_call(**kwargs)
+
+
+def _on_post_tool_call(**kwargs):
+    """Hook: buffers tool execution events for in-turn verification."""
+    runtime = _get_runtime()
+    if runtime is not None:
+        runtime.record_tool_call(**kwargs)
+
+
 def _on_pre_verify(**kwargs):
     """Hook: in-loop verification gate after file edits before completion."""
     runtime = _get_runtime()
     if runtime is None:
         return None
     return runtime.on_pre_verify(**kwargs)
-
-
-def _on_post_llm_call(**kwargs):
-    """Hook: fires after each completed agent turn."""
-    runtime = _get_runtime()
-    if runtime is None:
-        return
-    runtime.on_post_llm_call(**kwargs)
 
 
 def _on_session_finalize(**kwargs):

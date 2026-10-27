@@ -346,6 +346,55 @@ class TestAdvisorRuntime(unittest.TestCase):
             self.assertIn("def helper(): pass", diff_out, "Untracked new file must appear in diff")
             self.assertIn("name: Test CI", diff_out, ".github/ workflow file must appear in diff")
 
+    def test_verify_turn_approved(self):
+        class MockLLMResult:
+            text = '{"status": "approved", "reason": "All claims backed by tool output"}'
+
+        class MockCtx:
+            class MockLLM:
+                def complete(self, **kwargs):
+                    return MockLLMResult()
+            llm = MockLLM()
+
+        rt = runtime_mod.AdvisorRuntime(MockCtx())
+        # Record a tool event
+        rt.record_tool_call(tool_name="terminal", args={"command": "rm -rf /tmp/test"}, result="deleted", session_id="sess_1")
+        res = rt.verify_turn(claims=["deleted test directory"], session_id="sess_1")
+        self.assertEqual(res.get("status"), "approved")
+        self.assertTrue(rt._turn_verified.get("sess_1"))
+
+        # on_pre_verify must immediately allow when turn was approved
+        pre_res = rt.on_pre_verify(session_id="sess_1", changed_paths=["foo.py"], attempt=0)
+        self.assertIsNone(pre_res, "Pre-verify must immediately allow completion when verify_turn passed")
+
+    def test_verify_turn_rejected(self):
+        class MockLLMResult:
+            text = '{"status": "rejected", "reason": "No deletion command executed"}'
+
+        class MockCtx:
+            class MockLLM:
+                def complete(self, **kwargs):
+                    return MockLLMResult()
+            llm = MockLLM()
+
+        rt = runtime_mod.AdvisorRuntime(MockCtx())
+        res = rt.verify_turn(claims=["deleted test directory"], session_id="sess_2")
+        self.assertEqual(res.get("status"), "rejected")
+        self.assertFalse(rt._turn_verified.get("sess_2", False))
+
+    def test_tool_buffering_and_pre_llm_call_reset(self):
+        class MockCtx:
+            pass
+        rt = runtime_mod.AdvisorRuntime(MockCtx())
+        # Record tools
+        rt.record_tool_call(tool_name="terminal", args={"command": "ls"}, result="output", session_id="s1")
+        self.assertEqual(len(rt._turn_tool_events.get("s1", [])), 1)
+
+        # pre_llm_call resets buffer and injects context directive
+        ctx_dict = rt.on_pre_llm_call(session_id="s1")
+        self.assertIn("Verification Protocol", ctx_dict.get("context", ""))
+        self.assertEqual(len(rt._turn_tool_events.get("s1", [])), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
