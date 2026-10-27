@@ -116,7 +116,7 @@ def _get_git_diff(cwd: str, paths: list[str], max_chars: int = 12000) -> str | N
         for p in paths:
             if not p:
                 continue
-            full_path = Path(p) if os.path.isabs(p) else Path(cwd) / p
+            full_path = (Path(p) if os.path.isabs(p) else Path(cwd) / p).resolve()
             # Skip internal .git directory files, but allow .github/, .gitignore, etc.
             if ".git" in full_path.parts:
                 continue
@@ -614,6 +614,8 @@ class AdvisorRuntime:
         with self._state_lock:
             if sess not in self._turn_tool_events:
                 self._turn_tool_events[sess] = []
+            # Any new action invalidates a prior approval for this turn.
+            self._turn_verified[sess] = False
             res_str = str(result) if result is not None else ""
             res_str = _redact_secrets(res_str)
             if len(res_str) > 2000:
@@ -750,8 +752,8 @@ class AdvisorRuntime:
                     parsed = json.loads(m.group(0))
                 except Exception:
                     pass
-            if not parsed:
-                status = "approved" if "approved" in raw.lower() and "rejected" not in raw.lower() else "rejected"
+            if not isinstance(parsed, dict):
+                status = "approved" if re.match(r"^\W*approved\b", raw, re.IGNORECASE) else "rejected"
                 parsed = {"status": status, "reason": raw}
 
             if parsed.get("status") == "approved":
@@ -788,6 +790,9 @@ class AdvisorRuntime:
         audit = self.verify_turn(draft=response_text, session_id=session_id)
         if audit.get("status") == "approved":
             return None  # Verified and clean, deliver response unchanged
+        if audit.get("status") == "error":
+            logger.warning("transform_llm_output audit encountered error: %s", audit.get("reason"))
+            return None  # Fail open on provider error rather than injecting false contradiction alert
 
         # Auditor flagged discrepancies, omissions, or unverified claims!
         reason = audit.get("reason", "Discrepancy detected between claims and tool outputs.")
