@@ -29,7 +29,9 @@ _SECRET_PATTERNS = (
     re.compile(r"AIza[0-9A-Za-z_-]{35}"),
     re.compile(r"Bearer\s+[A-Za-z0-9\-._~+/]{20,}"),
     re.compile(r"-----BEGIN (?:RSA |EC )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC )?PRIVATE KEY-----"),
-    re.compile(r"(?i)\b(api_key|secret|password|token)\b\s*[:=]\s*['\"]?([A-Za-z0-9_\-]{8,})['\"]?"),
+    re.compile(
+        r"(?i)([A-Za-z0-9_]*(?:api[_-]?key|secret|password|passwd|token))['\"]?\s*[:=]\s*['\"]?([^\s'\",}]{8,})['\"]?"
+    ),
 )
 
 
@@ -40,6 +42,19 @@ def _redact_secrets(text: str) -> str:
     for pat in _SECRET_PATTERNS:
         text = pat.sub("[REDACTED SECRET]", text)
     return text
+
+
+def _redact_secrets_obj(val: Any) -> Any:
+    """Recursively scrub secrets in str, dict, list, and tuple values."""
+    if isinstance(val, str):
+        return _redact_secrets(val)
+    if isinstance(val, dict):
+        return {k: _redact_secrets_obj(v) for k, v in val.items()}
+    if isinstance(val, list):
+        return [_redact_secrets_obj(item) for item in val]
+    if isinstance(val, tuple):
+        return tuple(_redact_secrets_obj(item) for item in val)
+    return val
 
 
 def _find_guidelines(cwd: str) -> str:
@@ -184,6 +199,7 @@ def _get_git_diff(cwd: str, paths: list[str], max_chars: int = 12000) -> str | N
                 diff_chunks.append(chunk)
                 total_len += len(chunk)
                 if total_len > max_chars:
+                    diff_chunks.append("\n... [further changed paths omitted due to diff size limit] ...\n")
                     break
 
         if not diff_chunks:
@@ -279,7 +295,6 @@ class AdvisorRuntime:
         self._state_lock = threading.RLock()
         self.state = self._load_state()
         self._session_states: dict[str, AdvisorState] = {}
-        self._pre_verified_sessions: dict[str, tuple[str, ...]] = {}
         self._turn_tool_events: dict[str, list[dict]] = {}
         self._turn_verified: dict[str, bool] = {}
 
@@ -626,10 +641,7 @@ class AdvisorRuntime:
                     + f"\n... [truncated {len(res_str) - 2000} chars] ...\n"
                     + res_str[-tail_len:]
                 )
-            clean_args = {}
-            if args:
-                for k, v in args.items():
-                    clean_args[k] = _redact_secrets(str(v)) if isinstance(v, str) else v
+            clean_args = _redact_secrets_obj(args) if args else {}
             self._turn_tool_events[sess].append({
                 "tool": tool_name,
                 "args": clean_args,
@@ -664,6 +676,9 @@ class AdvisorRuntime:
             self._turn_tool_events[sess] = []
             self._turn_verified[sess] = False
 
+        if not self.state.enabled or os.environ.get(ADVISOR_NO_REVIEW):
+            return {}
+
         return {
             "context": (
                 "[Verification Gate]: On any turn where you executed tools or performed actions, you must call "
@@ -676,6 +691,8 @@ class AdvisorRuntime:
         self, *, draft: str = "", claims: list[str] | str | None = None, session_id: str = ""
     ) -> dict:
         """Audit draft response and tool actions against full session history and constraints."""
+        if not self.state.enabled or os.environ.get(ADVISOR_NO_REVIEW):
+            return {"status": "approved", "reason": "Advisor disabled"}
         sess = session_id or "default"
         with self._state_lock:
             events = list(self._turn_tool_events.get(sess, []))
@@ -756,7 +773,8 @@ class AdvisorRuntime:
                 status = "approved" if re.match(r"^\W*approved\b", raw, re.IGNORECASE) else "rejected"
                 parsed = {"status": status, "reason": raw}
 
-            if parsed.get("status") == "approved":
+            parsed["status"] = str(parsed.get("status", "")).strip().lower() or "rejected"
+            if parsed["status"] == "approved":
                 with self._state_lock:
                     self._turn_verified[sess] = True
             return parsed
@@ -847,10 +865,10 @@ class AdvisorRuntime:
             return None
 
         # Cap self-correction nudges to 2 attempts. When capped, turn finishes and
-        # unresolved issues fall back to post_llm_call background review so findings aren't lost.
+        # any remaining issues are handled by the transform_llm_output safety net.
         if attempt >= 2:
             logger.debug(
-                "Advisor pre_verify: reached max nudge attempt (%d >= 2), allowing turn to finish (will review in background)",
+                "Advisor pre_verify: reached max nudge attempt (%d >= 2), allowing turn to finish",
                 attempt,
             )
             return None
@@ -863,6 +881,7 @@ class AdvisorRuntime:
         if not diff_text:
             logger.debug("Advisor pre_verify: empty diff for %s, skipping", changed_paths)
             return None
+        diff_text = _redact_secrets(diff_text)
 
         guidelines = _find_guidelines(cwd)
         directives = self._session_user_directives(session_id)
@@ -911,10 +930,14 @@ class AdvisorRuntime:
             logger.warning("Advisor pre_verify LLM call failed: %s", exc)
             return None
 
-        if not review_text or review_text.lower().startswith("nothing to flag"):
+        if not review_text:
+            logger.debug("Advisor pre_verify: empty review response, inconclusive")
+            return None
+
+        if review_text.lower().startswith("nothing to flag"):
             logger.info("Advisor pre_verify: diff approved ('nothing to flag')")
             with self._state_lock:
-                self._pre_verified_sessions[session_id or "default"] = tuple(sorted(changed_paths))
+                self._turn_verified[session_id or "default"] = True
             return None
 
         if "[BLOCKER]" in review_text or "[CONCERN]" in review_text:
@@ -928,8 +951,7 @@ class AdvisorRuntime:
                 ),
             }
 
-        with self._state_lock:
-            self._pre_verified_sessions[session_id or "default"] = tuple(sorted(changed_paths))
+        logger.debug("Advisor pre_verify: review was inconclusive (%s)", review_text[:100])
         return None
 
     def _build_review_prompt(

@@ -277,20 +277,8 @@ class TestAdvisorRuntime(unittest.TestCase):
             )
             # Must allow completion
             self.assertIsNone(res)
-            # Session must be marked as pre-verified
-            self.assertIn("test_sess_clean", rt._pre_verified_sessions)
-
-            # on_post_llm_call right after must skip background review
-            called = []
-            rt._enqueue_review = lambda delta: called.append(delta)
-            rt.on_post_llm_call(
-                session_id="test_sess_clean",
-                turn_id="turn_1",
-                user_message="build it",
-                assistant_response="done",
-                conversation_history=[{"role": "user", "content": "build it"}]
-            )
-            self.assertEqual(called, [], "post_llm_call must skip review when turn was pre-verified")
+            # Session must be marked as turn-verified
+            self.assertTrue(rt._turn_verified.get("test_sess_clean", False))
         finally:
             runtime_mod._get_git_diff = orig_diff
 
@@ -306,8 +294,8 @@ class TestAdvisorRuntime(unittest.TestCase):
             final_response="Done."
         )
         self.assertIsNone(res)
-        # Attempt >= 2 must NOT add to _pre_verified_sessions so post_llm_call can review remaining findings
-        self.assertNotIn("test_sess", rt._pre_verified_sessions)
+        # Attempt >= 2 must NOT mark as verified so transform_llm_output can catch remaining issues
+        self.assertFalse(rt._turn_verified.get("test_sess", False))
 
     def test_git_diff_real_repo_cases(self):
         import subprocess
