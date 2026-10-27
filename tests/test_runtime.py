@@ -494,6 +494,42 @@ class TestAdvisorRuntime(unittest.TestCase):
         rt.record_tool_call(tool_name="terminal", args={"command": "ls"}, result="ok", session_id="s1")
         self.assertFalse(rt._turn_verified.get("s1", False))
 
+    def test_redact_secrets_obj_recursive(self):
+        redact_obj = getattr(runtime_mod, "_redact_secrets_obj", lambda x: x)
+        nested = {
+            "auth": {
+                "token": "sk-1234567890abcdef12345678",
+                "list": ["ghp_123456789012345678901234567890123456", "safe_val"]
+            }
+        }
+        cleaned = redact_obj(nested)
+        self.assertEqual(cleaned["auth"]["token"], "[REDACTED SECRET]")
+        self.assertEqual(cleaned["auth"]["list"][0], "[REDACTED SECRET]")
+        self.assertEqual(cleaned["auth"]["list"][1], "safe_val")
+
+    def test_advisor_disabled_pre_llm_and_verify(self):
+        class MockCtx:
+            pass
+        rt = runtime_mod.AdvisorRuntime(MockCtx())
+        rt.state.enabled = False
+        self.assertEqual(rt.on_pre_llm_call(session_id="s_off"), {})
+        res = rt.verify_turn(draft="anything", session_id="s_off")
+        self.assertEqual(res.get("status"), "approved")
+
+    def test_verify_turn_status_normalization(self):
+        class MockLLMResult:
+            text = '{"status": "  Approved  ", "reason": "Looks good"}'
+        class MockLLM:
+            def complete(self, **kw):
+                return MockLLMResult()
+        class MockCtx:
+            llm = MockLLM()
+
+        rt = runtime_mod.AdvisorRuntime(MockCtx())
+        res = rt.verify_turn(draft="testing normalization", session_id="s_norm")
+        self.assertEqual(res.get("status"), "approved")
+        self.assertTrue(rt._turn_verified.get("s_norm", False))
+
 
 if __name__ == "__main__":
     unittest.main()
