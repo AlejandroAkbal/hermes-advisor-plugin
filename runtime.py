@@ -109,7 +109,16 @@ def _get_git_diff(cwd: str, paths: list[str], max_chars: int = 12000) -> str | N
                 text=True,
                 timeout=3,
             )
-            repo_dir = res_root.stdout.strip() if res_root.returncode == 0 else None
+            raw_repo = res_root.stdout.strip() if res_root.returncode == 0 else None
+            repo_dir = None
+            if raw_repo:
+                repo_path = Path(raw_repo).resolve()
+                plugin_root = Path(__file__).resolve().parent
+                # Ensure the file is actually inside the detected repo, and avoid auditing
+                # the advisor plugin's own repo for unrelated tasks
+                if full_path.resolve().is_relative_to(repo_path):
+                    if repo_path != plugin_root or full_path.resolve().is_relative_to(plugin_root):
+                        repo_dir = raw_repo
 
             chunk = ""
             if not full_path.exists():
