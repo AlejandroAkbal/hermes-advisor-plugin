@@ -93,32 +93,35 @@ def _get_git_diff(cwd: str, paths: list[str], max_chars: int = 12000) -> str | N
         total_len = 0
 
         for p in paths:
-            if not p or ".git" in p:
+            if not p or ".git" in str(p):
                 continue
             full_path = Path(p) if os.path.isabs(p) else Path(cwd) / p
             if not full_path.exists():
                 continue
 
+            rel_p = os.path.relpath(full_path, cwd)
+
             # Check if tracked by git
             res_track = subprocess.run(
-                ["git", "ls-files", "--error-unmatch", str(p)],
+                ["git", "ls-files", "--error-unmatch", "--", rel_p],
                 cwd=cwd,
                 capture_output=True,
                 text=True,
                 timeout=3,
             )
             if res_track.returncode == 0:
-                # Tracked: diff against HEAD or working tree
-                cmd = ["git", "diff", "HEAD", "--", str(p)]
+                # Tracked: diff against HEAD (covers staged and unstaged edits in one pass)
+                cmd = ["git", "diff", "HEAD", "--", rel_p]
                 res = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=5)
                 chunk = res.stdout.strip() if res.returncode == 0 else ""
                 if not chunk:
-                    cmd_c = ["git", "diff", "--", str(p)]
+                    # Fallback to working-tree diff if HEAD is not yet committed (fresh repo)
+                    cmd_c = ["git", "diff", "--", rel_p]
                     res_c = subprocess.run(cmd_c, cwd=cwd, capture_output=True, text=True, timeout=5)
                     chunk = res_c.stdout.strip() if res_c.returncode == 0 else ""
             else:
                 # Untracked/new file: diff against /dev/null (exit 1 is normal for non-empty diff)
-                cmd = ["git", "diff", "--no-index", "/dev/null", str(full_path)]
+                cmd = ["git", "diff", "--no-index", "--", "/dev/null", rel_p]
                 res = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=5)
                 chunk = res.stdout.strip()
 
@@ -129,6 +132,8 @@ def _get_git_diff(cwd: str, paths: list[str], max_chars: int = 12000) -> str | N
                     break
 
         if not diff_chunks:
+            if paths:
+                logger.warning("Advisor: changed_paths non-empty (%s) but diff was empty in %s", paths, cwd)
             return None
 
         full_diff = "\n\n".join(diff_chunks)
@@ -616,10 +621,16 @@ class AdvisorRuntime:
         with self._state_lock:
             if not self.state.enabled:
                 return None
+        if os.environ.get(ADVISOR_NO_REVIEW):
+            return None
 
-        # Cap self-correction nudges to 2 attempts
+        # Cap self-correction nudges to 2 attempts. When capped, turn finishes and
+        # unresolved issues fall back to post_llm_call background review so findings aren't lost.
         if attempt >= 2:
-            logger.debug("Advisor pre_verify: reached max nudge attempt (%d >= 2), allowing turn to finish", attempt)
+            logger.debug(
+                "Advisor pre_verify: reached max nudge attempt (%d >= 2), allowing turn to finish (will review in background)",
+                attempt,
+            )
             return None
 
         if not changed_paths:
