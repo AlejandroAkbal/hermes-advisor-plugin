@@ -83,7 +83,7 @@ SNIPPET_CAP = 600
 
 
 def _get_git_diff(cwd: str, paths: list[str], max_chars: int = 12000) -> str | None:
-    """Run git diff on changed paths safely, including new and untracked files."""
+    """Run git diff on changed paths safely, including new, untracked, and deleted files."""
     try:
         import os
         import subprocess
@@ -93,36 +93,61 @@ def _get_git_diff(cwd: str, paths: list[str], max_chars: int = 12000) -> str | N
         total_len = 0
 
         for p in paths:
-            if not p or ".git" in str(p):
+            if not p:
                 continue
             full_path = Path(p) if os.path.isabs(p) else Path(cwd) / p
-            if not full_path.exists():
+            # Skip internal .git directory files, but allow .github/, .gitignore, etc.
+            if ".git" in full_path.parts:
                 continue
 
-            rel_p = os.path.relpath(full_path, cwd)
+            parent_dir = full_path.parent if full_path.parent.exists() else Path(cwd)
 
-            # Check if tracked by git
-            res_track = subprocess.run(
-                ["git", "ls-files", "--error-unmatch", "--", rel_p],
-                cwd=cwd,
+            # Resolve git repo root for this specific file
+            res_root = subprocess.run(
+                ["git", "-C", str(parent_dir), "rev-parse", "--show-toplevel"],
                 capture_output=True,
                 text=True,
                 timeout=3,
             )
-            if res_track.returncode == 0:
-                # Tracked: diff against HEAD (covers staged and unstaged edits in one pass)
-                cmd = ["git", "diff", "HEAD", "--", rel_p]
-                res = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=5)
-                chunk = res.stdout.strip() if res.returncode == 0 else ""
+            repo_dir = res_root.stdout.strip() if res_root.returncode == 0 else None
+
+            chunk = ""
+            if not full_path.exists():
+                # Handle deleted file
+                if repo_dir:
+                    rel_p = os.path.relpath(full_path, repo_dir)
+                    cmd = ["git", "-C", repo_dir, "diff", "HEAD", "--", rel_p]
+                    res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+                    chunk = res.stdout.strip() if res.returncode == 0 else ""
                 if not chunk:
-                    # Fallback to working-tree diff if HEAD is not yet committed (fresh repo)
-                    cmd_c = ["git", "diff", "--", rel_p]
-                    res_c = subprocess.run(cmd_c, cwd=cwd, capture_output=True, text=True, timeout=5)
-                    chunk = res_c.stdout.strip() if res_c.returncode == 0 else ""
+                    chunk = f"deleted file: {p}"
+            elif repo_dir:
+                # File exists within a git repo
+                rel_p = os.path.relpath(full_path, repo_dir)
+                res_track = subprocess.run(
+                    ["git", "-C", repo_dir, "ls-files", "--error-unmatch", "--", rel_p],
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
+                )
+                if res_track.returncode == 0:
+                    # Tracked: diff against HEAD (staged + unstaged edits)
+                    cmd = ["git", "-C", repo_dir, "diff", "HEAD", "--", rel_p]
+                    res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+                    chunk = res.stdout.strip() if res.returncode == 0 else ""
+                    if not chunk:
+                        cmd_c = ["git", "-C", repo_dir, "diff", "--", rel_p]
+                        res_c = subprocess.run(cmd_c, capture_output=True, text=True, timeout=5)
+                        chunk = res_c.stdout.strip() if res_c.returncode == 0 else ""
+                else:
+                    # Untracked in repo: diff against /dev/null
+                    cmd = ["git", "-C", repo_dir, "diff", "--no-index", "--", "/dev/null", rel_p]
+                    res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+                    chunk = res.stdout.strip()
             else:
-                # Untracked/new file: diff against /dev/null (exit 1 is normal for non-empty diff)
-                cmd = ["git", "diff", "--no-index", "--", "/dev/null", rel_p]
-                res = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=5)
+                # Outside git repo entirely: diff against /dev/null
+                cmd = ["git", "diff", "--no-index", "--", "/dev/null", str(full_path)]
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
                 chunk = res.stdout.strip()
 
             if chunk:

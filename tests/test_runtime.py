@@ -306,6 +306,45 @@ class TestAdvisorRuntime(unittest.TestCase):
             final_response="Done."
         )
         self.assertIsNone(res)
+        # Attempt >= 2 must NOT add to _pre_verified_sessions so post_llm_call can review remaining findings
+        self.assertNotIn("test_sess", rt._pre_verified_sessions)
+
+    def test_git_diff_real_repo_cases(self):
+        import subprocess
+        _get_diff = runtime_mod._get_git_diff
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # 1. Initialize git repo
+            subprocess.run(["git", "init"], cwd=tmpdir, check=True, capture_output=True)
+            
+            # Tracked file
+            f1 = Path(tmpdir) / "app.py"
+            f1.write_text("x = 1\n")
+            subprocess.run(["git", "add", "app.py"], cwd=tmpdir, check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=tmpdir, check=True, capture_output=True)
+            f1.write_text("x = 2\n")
+            
+            # Untracked new file
+            f2 = Path(tmpdir) / "helper.py"
+            f2.write_text("def helper(): pass\n")
+            
+            # .github/ workflow file (must NOT be skipped by .git check)
+            gh_dir = Path(tmpdir) / ".github" / "workflows"
+            gh_dir.mkdir(parents=True)
+            f3 = gh_dir / "ci.yml"
+            f3.write_text("name: Test CI\n")
+            
+            # Deleted file
+            f4 = Path(tmpdir) / "obsolete.py"
+            f4.write_text("remove me\n")
+            subprocess.run(["git", "add", "obsolete.py"], cwd=tmpdir, check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "add obsolete"], cwd=tmpdir, check=True, capture_output=True)
+            f4.unlink()
+            
+            diff_out = _get_diff(tmpdir, ["app.py", "helper.py", ".github/workflows/ci.yml", "obsolete.py"])
+            self.assertIsNotNone(diff_out)
+            self.assertIn("x = 2", diff_out, "Tracked change must appear in diff")
+            self.assertIn("def helper(): pass", diff_out, "Untracked new file must appear in diff")
+            self.assertIn("name: Test CI", diff_out, ".github/ workflow file must appear in diff")
 
 
 if __name__ == "__main__":
