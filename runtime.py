@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import queue
+import re
 import threading
 from contextvars import copy_context
 from pathlib import Path
@@ -20,6 +21,25 @@ ADVISOR_NO_REVIEW = "ADVISOR_NO_REVIEW"
 WATCHDOG_FILENAME = "WATCHDOG.md"
 REVIEW_TIMEOUT_SECONDS = 90
 SHUTDOWN_GRACE_SECONDS = 1.0
+
+_SECRET_PATTERNS = (
+    re.compile(r"sk-[a-zA-Z0-9_-]{20,}"),
+    re.compile(r"ghp_[a-zA-Z0-9]{36}"),
+    re.compile(r"xoxb-[0-9]{10,13}-[0-9]{10,13}-[a-zA-Z0-9]{24}"),
+    re.compile(r"AIza[0-9A-Za-z_-]{35}"),
+    re.compile(r"Bearer\s+[A-Za-z0-9\-._~+/]{20,}"),
+    re.compile(r"-----BEGIN (?:RSA |EC )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC )?PRIVATE KEY-----"),
+    re.compile(r"(?i)\b(api_key|secret|password|token)\b\s*[:=]\s*['\"]?([A-Za-z0-9_\-]{8,})['\"]?"),
+)
+
+
+def _redact_secrets(text: str) -> str:
+    """Scrub common tokens, keys, and credentials before LLM dispatch."""
+    if not text:
+        return ""
+    for pat in _SECRET_PATTERNS:
+        text = pat.sub("[REDACTED SECRET]", text)
+    return text
 
 
 def _find_guidelines(cwd: str) -> str:
@@ -595,11 +615,22 @@ class AdvisorRuntime:
             if sess not in self._turn_tool_events:
                 self._turn_tool_events[sess] = []
             res_str = str(result) if result is not None else ""
+            res_str = _redact_secrets(res_str)
             if len(res_str) > 2000:
-                res_str = res_str[:1000] + f"\n... [truncated {len(res_str)} chars] ...\n" + res_str[-1000:]
+                head_len = 650
+                tail_len = 1350
+                res_str = (
+                    res_str[:head_len]
+                    + f"\n... [truncated {len(res_str) - 2000} chars] ...\n"
+                    + res_str[-tail_len:]
+                )
+            clean_args = {}
+            if args:
+                for k, v in args.items():
+                    clean_args[k] = _redact_secrets(str(v)) if isinstance(v, str) else v
             self._turn_tool_events[sess].append({
                 "tool": tool_name,
-                "args": args or {},
+                "args": clean_args,
                 "result": res_str,
             })
 
@@ -730,6 +761,42 @@ class AdvisorRuntime:
         except Exception as exc:
             logger.warning("verify_turn audit failed: %s", exc)
             return {"status": "error", "reason": f"Advisor evaluation failed: {exc}"}
+
+    def on_transform_llm_output(
+        self,
+        *,
+        response_text: str = "",
+        session_id: str = "",
+        model: str = "",
+        platform: str = "",
+        turn_id: str = "",
+        **kwargs,
+    ) -> str | None:
+        """Enforce verification: if tools ran this turn but verify_turn was skipped, audit before delivery."""
+        if not self.state.enabled or os.environ.get(ADVISOR_NO_REVIEW):
+            return None
+        sess = session_id or "default"
+        with self._state_lock:
+            tools_ran = bool(self._turn_tool_events.get(sess))
+            already_verified = self._turn_verified.get(sess, False)
+
+        if not tools_ran or already_verified:
+            return None
+
+        # Tools were executed, but the agent skipped calling verify_turn!
+        logger.info("Forced verification running via transform_llm_output for session %s", sess)
+        audit = self.verify_turn(draft=response_text, session_id=session_id)
+        if audit.get("status") == "approved":
+            return None  # Verified and clean, deliver response unchanged
+
+        # Auditor flagged discrepancies, omissions, or unverified claims!
+        reason = audit.get("reason", "Discrepancy detected between claims and tool outputs.")
+        return (
+            f"{response_text}\n\n"
+            f"---\n"
+            f"⚠️ **[Verification Alert]** The auditor caught discrepancies in this answer:\n"
+            f"> {reason}"
+        )
 
     def _session_user_directives(self, session_id: str = "") -> list[str]:
         """Pull user directives from state.db for the given session."""

@@ -124,6 +124,7 @@ def register(ctx):
     ctx.register_hook("pre_llm_call", _on_pre_llm_call)
     ctx.register_hook("post_tool_call", _on_post_tool_call)
     ctx.register_hook("pre_verify", _on_pre_verify)
+    ctx.register_hook("transform_llm_output", _on_transform_llm_output)
     ctx.register_hook("on_session_finalize", _on_session_finalize)
 
     # Register the /advisor slash command
@@ -171,6 +172,14 @@ def _on_pre_verify(**kwargs):
     if runtime is None:
         return None
     return runtime.on_pre_verify(**kwargs)
+
+
+def _on_transform_llm_output(**kwargs) -> str | None:
+    """Hook: enforces verification on final response before delivery."""
+    runtime = _get_runtime()
+    if runtime is None:
+        return None
+    return runtime.on_transform_llm_output(**kwargs)
 
 
 def _on_session_finalize(**kwargs):

@@ -420,6 +420,61 @@ class TestAdvisorRuntime(unittest.TestCase):
             self.assertFalse(d.startswith("◆ Advisor review"))
             self.assertFalse(d == "...")
 
+    def test_secret_redaction(self):
+        redact = getattr(runtime_mod, "_redact_secrets", lambda s: s)
+        sample = "sk-abcdef1234567890abcdef123456 ghp_123456789012345678901234567890123456 Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+        cleaned = redact(sample)
+        self.assertNotIn("sk-abcdef", cleaned)
+        self.assertNotIn("ghp_123456", cleaned)
+        self.assertNotIn("eyJhbGci", cleaned)
+        self.assertIn("[REDACTED SECRET]", cleaned)
+
+    def test_transform_llm_output_no_tools_returns_none(self):
+        class MockCtx:
+            pass
+        rt = runtime_mod.AdvisorRuntime(MockCtx())
+        res = rt.on_transform_llm_output(response_text="Hello world", session_id="s_clean")
+        self.assertIsNone(res)
+
+    def test_transform_llm_output_already_verified_returns_none(self):
+        class MockCtx:
+            pass
+        rt = runtime_mod.AdvisorRuntime(MockCtx())
+        rt.record_tool_call(tool_name="terminal", args={"command": "ls"}, result="ok", session_id="s_v")
+        rt._turn_verified["s_v"] = True
+        res = rt.on_transform_llm_output(response_text="Hello world", session_id="s_v")
+        self.assertIsNone(res)
+
+    def test_transform_llm_output_catches_unverified_turn(self):
+        class MockLLMResult:
+            text = '{"status": "rejected", "reason": "Claim contradicted by tool output."}'
+        class MockLLM:
+            def complete(self, **kw):
+                return MockLLMResult()
+        class MockCtx:
+            llm = MockLLM()
+
+        rt = runtime_mod.AdvisorRuntime(MockCtx())
+        rt.record_tool_call(tool_name="terminal", args={"command": "rm -rf foo"}, result="Permission denied", session_id="s_unv")
+        res = rt.on_transform_llm_output(response_text="I deleted foo successfully.", session_id="s_unv")
+        self.assertIsNotNone(res)
+        self.assertIn("Verification Alert", res)
+        self.assertIn("Claim contradicted by tool output", res)
+
+    def test_transform_llm_output_approves_unverified_turn_cleanly(self):
+        class MockLLMResult:
+            text = '{"status": "approved", "reason": "Draft is accurate."}'
+        class MockLLM:
+            def complete(self, **kw):
+                return MockLLMResult()
+        class MockCtx:
+            llm = MockLLM()
+
+        rt = runtime_mod.AdvisorRuntime(MockCtx())
+        rt.record_tool_call(tool_name="terminal", args={"command": "ls"}, result="file1.txt", session_id="s_ok")
+        res = rt.on_transform_llm_output(response_text="file1.txt was found.", session_id="s_ok")
+        self.assertIsNone(res)
+
 
 if __name__ == "__main__":
     unittest.main()
