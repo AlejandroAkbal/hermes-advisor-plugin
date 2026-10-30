@@ -1,5 +1,6 @@
 """Unit tests for Hermes Advisor runtime helpers."""
 
+import os
 import sys
 import tempfile
 import unittest
@@ -535,6 +536,40 @@ class TestAdvisorRuntime(unittest.TestCase):
             res = rt.verify_turn(draft="testing normalization", session_id="s_norm")
             self.assertEqual(res.get("status"), "approved")
             self.assertTrue(rt._turn_verified.get("s_norm", False))
+        finally:
+            if orig_no_review is not None:
+                os.environ[runtime_mod.ADVISOR_NO_REVIEW] = orig_no_review
+
+    def test_verify_turn_two_channel_evidence_separation(self):
+        class MockLLMResult:
+            text = '{"status": "approved", "reason": "Draft is natural and evidence verifies claims"}'
+        class MockLLM:
+            def __init__(self):
+                self.captured_prompt: str = ""
+            def complete(self, **kw):
+                messages = kw.get("messages", [])
+                self.captured_prompt = "\n".join(m.get("content", "") for m in messages)
+                return MockLLMResult()
+        class MockCtx:
+            def __init__(self):
+                self.llm = MockLLM()
+
+        ctx = MockCtx()
+        rt = runtime_mod.AdvisorRuntime(ctx)
+        rt.state.enabled = True
+        dummy_secret = "sk-" + "c" * 24
+        orig_no_review = os.environ.pop(runtime_mod.ADVISOR_NO_REVIEW, None)
+        try:
+            res = rt.verify_turn(
+                draft="Clean, natural user response without plumbing.",
+                evidence=f"PID 1234, exit code 0, key={dummy_secret}.",
+                session_id="s_twoway"
+            )
+            self.assertEqual(res.get("status"), "approved")
+            self.assertIn("### Proposed User-Facing Response (Draft):\nClean, natural user response without plumbing.", ctx.llm.captured_prompt)
+            self.assertIn("### Technical Verification Evidence (Internal Notes for Auditor):\nPID 1234, exit code 0, key=[REDACTED SECRET].", ctx.llm.captured_prompt)
+            self.assertNotIn(dummy_secret, ctx.llm.captured_prompt)
+            self.assertIn("Natural Communication Style", ctx.llm.captured_prompt)
         finally:
             if orig_no_review is not None:
                 os.environ[runtime_mod.ADVISOR_NO_REVIEW] = orig_no_review

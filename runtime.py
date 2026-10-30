@@ -682,13 +682,19 @@ class AdvisorRuntime:
         return {
             "context": (
                 "[Verification Gate]: On any turn where you executed tools or performed actions, you must call "
-                "verify_turn(draft=\"<your proposed response or summary of actions>\") before delivering your final answer. "
-                "The auditor evaluates your draft and tool results against the full session history and user constraints."
+                'verify_turn(draft="<your natural response for user>", evidence="<optional technical verification notes for auditor>") '
+                "before delivering your final answer. The draft should be natural, direct, and human (no robotic compliance text or routine tool plumbing; "
+                "surface material failures or decisions plainly); raw technical proofs and tool details belong in evidence or tool events."
             )
         }
 
     def verify_turn(
-        self, *, draft: str = "", claims: list[str] | str | None = None, session_id: str = ""
+        self,
+        *,
+        draft: str = "",
+        claims: list[str] | str | None = None,
+        evidence: str = "",
+        session_id: str = "",
     ) -> dict:
         """Audit draft response and tool actions against full session history and constraints."""
         if not self.state.enabled or os.environ.get(ADVISOR_NO_REVIEW):
@@ -716,12 +722,20 @@ class AdvisorRuntime:
         system_prompt = (
             "You are an objective auditor and senior coworker verifying an AI agent's actions and draft response.\n"
             "You have access to the full session context: user directives, recent conversation history, and the raw tool execution events of this turn.\n\n"
-            "Evaluate the agent's work against these strict rules:\n"
-            "1. Did the agent take actions or make claims contradicted by the tool outputs? (e.g. claim deleted/verified when output shows error or omission)\n"
-            "2. Did the agent violate any standing user directives or explicit constraints from this session?\n"
-            "3. If the agent's draft and actions are sound, accurate, and faithful to tool results and user constraints, APPROVE.\n"
-            "4. If there is a hallucination, unverified claim, or missed constraint, REJECT and specify the exact fix.\n\n"
-            "Respond in JSON format: {\"status\": \"approved\" | \"rejected\", \"reason\": \"...\"}"
+            "Evaluate the agent's work against these strict verification and communication rules:\n"
+            "1. Faithful & Truthful: Did the agent make claims contradicted by the tool outputs (e.g. claim success when tool errored, or claim 0 failures when errors occurred)? If so, REJECT.\n"
+            "2. Corroborated Evidence: Do NOT treat agent-supplied `evidence` as verified ground truth on its own. Technical claims must be corroborated by recorded tool execution events or session history; treat uncorroborated evidence as an assertion to check.\n"
+            "3. User Directives & Invariants: Did the agent violate any standing user directives or explicit constraints from this session? If so, REJECT.\n"
+            "4. Natural Communication Style & Material Caveats (SOUL.md):\n"
+            "   - The `draft` is user-facing communication for Alejandro. It must be natural, direct, and concise (plain claims, no filler, no robotic templates, no narrating routine tool calls, tab IDs, or exit codes).\n"
+            "   - Surface real blockers, material failures, or required decisions plainly in the draft. Do not hide them in evidence.\n"
+            "   - Do NOT reject a draft simply because it cleanly summarizes outcomes without reciting routine technical plumbing, as long as the summary is truthful and corroborated by tool events.\n"
+            "   - Reject drafts that read like bureaucratic compliance affidavits, legal disclaimers, or defensive apologies. The agent is a peer engineer speaking directly to Alejandro, not writing a compliance filing.\n"
+            "5. Action-First Guidance:\n"
+            "   - If a claim lacks evidence or was not checked, instruct the agent to RUN THE TOOL to verify it, or DROP the claim entirely.\n"
+            "   - Never demand that the agent write a defensive paragraph admitting it didn't verify something. Action comes first.\n"
+            "6. If the draft is sound, truthful, answers the user's ask, and is written naturally for a human, APPROVE.\n\n"
+            'Respond in JSON format: {"status": "approved" | "rejected", "reason": "..."}'
         )
 
         user_prompt_parts = []
@@ -738,7 +752,9 @@ class AdvisorRuntime:
         user_prompt_parts.append("### Tool Execution Events (This Turn):\n" + ("\n\n".join(events_formatted) if events_formatted else "None (no tools called)."))
 
         if draft:
-            user_prompt_parts.append(f"### Proposed Draft / Actions:\n{draft}")
+            user_prompt_parts.append(f"### Proposed User-Facing Response (Draft):\n{draft}")
+        if evidence:
+            user_prompt_parts.append(f"### Technical Verification Evidence (Internal Notes for Auditor):\n{_redact_secrets(str(evidence))}")
         if claims:
             if isinstance(claims, str):
                 claims = [claims]
