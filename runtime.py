@@ -683,8 +683,8 @@ class AdvisorRuntime:
             "context": (
                 "[Verification Gate]: On any turn where you executed tools or performed actions, you must call "
                 'verify_turn(draft="<your natural response for user>", evidence="<optional technical verification notes for auditor>") '
-                "before delivering your final answer. The draft should be natural, direct, and human (no robotic compliance text or routine tool plumbing); "
-                "technical proof and caveats belong in evidence or tool events."
+                "before delivering your final answer. The draft should be natural, direct, and human (no robotic compliance text or routine tool plumbing; "
+                "surface material failures or decisions plainly); raw technical proofs and tool details belong in evidence or tool events."
             )
         }
 
@@ -726,8 +726,9 @@ class AdvisorRuntime:
             "1. Faithful & Truthful: Did the agent make claims contradicted by the tool outputs (e.g. claim success when tool errored, or claim 0 failures when errors occurred)? If so, REJECT.\n"
             "2. Corroborated Evidence: Do NOT treat agent-supplied `evidence` as verified ground truth on its own. Technical claims must be corroborated by recorded tool execution events or session history; treat uncorroborated evidence as an assertion to check.\n"
             "3. User Directives & Invariants: Did the agent violate any standing user directives or explicit constraints from this session? If so, REJECT.\n"
-            "4. Natural Communication Style (SOUL.md):\n"
+            "4. Natural Communication Style & Material Caveats (SOUL.md):\n"
             "   - The `draft` is user-facing communication for Alejandro. It must be natural, direct, and concise (plain claims, no filler, no robotic templates, no narrating routine tool calls, tab IDs, or exit codes).\n"
+            "   - Surface real blockers, material failures, or required decisions plainly in the draft. Do not hide them in evidence.\n"
             "   - Do NOT reject a draft simply because it cleanly summarizes outcomes without reciting routine technical plumbing, as long as the summary is truthful and corroborated by tool events.\n"
             "   - Reject drafts that read like bureaucratic compliance affidavits, legal disclaimers, or defensive apologies. The agent is a peer engineer speaking directly to Alejandro, not writing a compliance filing.\n"
             "5. Action-First Guidance:\n"

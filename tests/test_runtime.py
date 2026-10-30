@@ -569,7 +569,7 @@ class TestAdvisorRuntime(unittest.TestCase):
             self.assertIn("### Proposed User-Facing Response (Draft):\nClean, natural user response without plumbing.", ctx.llm.captured_prompt)
             self.assertIn("### Technical Verification Evidence (Internal Notes for Auditor):\nPID 1234, exit code 0, key=[REDACTED SECRET].", ctx.llm.captured_prompt)
             self.assertNotIn(dummy_secret, ctx.llm.captured_prompt)
-            self.assertIn("Natural Communication Style (SOUL.md)", ctx.llm.captured_prompt)
+            self.assertIn("Natural Communication Style", ctx.llm.captured_prompt)
         finally:
             if orig_no_review is not None:
                 os.environ[runtime_mod.ADVISOR_NO_REVIEW] = orig_no_review
