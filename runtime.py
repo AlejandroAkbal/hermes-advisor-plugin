@@ -297,6 +297,7 @@ class AdvisorRuntime:
         self._session_states: dict[str, AdvisorState] = {}
         self._turn_tool_events: dict[str, list[dict]] = {}
         self._turn_verified: dict[str, bool] = {}
+        self._session_history: dict[str, list[dict]] = {}
 
         # Current turn tracking — populated from post_llm_call kwargs
         self.last_turn_key: tuple[str, str] | None = None
@@ -672,9 +673,12 @@ class AdvisorRuntime:
     def on_pre_llm_call(self, *, session_id: str = "", **kwargs) -> dict:
         """Inject verification directive into active turn context for all sessions."""
         sess = session_id or "default"
+        history = kwargs.get("conversation_history")
         with self._state_lock:
             self._turn_tool_events[sess] = []
             self._turn_verified[sess] = False
+            if history:
+                self._session_history[sess] = list(history)
 
         if not self.state.enabled or os.environ.get(ADVISOR_NO_REVIEW):
             return {}
@@ -702,11 +706,13 @@ class AdvisorRuntime:
         sess = session_id or "default"
         with self._state_lock:
             events = list(self._turn_tool_events.get(sess, []))
+            history_msgs = list(self._session_history.get(sess, []))
 
         # Directives across the entire session from past human messages
         directives = self._session_user_directives(session_id)
-        # Recent conversation history
-        history_msgs = self._session_messages(session_id, limit=10)
+        # Recent conversation history fallback if memory cache not yet populated
+        if not history_msgs:
+            history_msgs = self._session_messages(session_id, limit=10)
 
         # Find the latest user query from history
         latest_user_query = ""
@@ -745,6 +751,30 @@ class AdvisorRuntime:
             user_prompt_parts.append("### User Directives & Constraints (Session Context):\n" + "\n".join(f"- {d}" for d in directives))
         if latest_user_query:
             user_prompt_parts.append(f"### Current User Request:\n{latest_user_query}")
+
+        # Recent dialogue context leading into this turn
+        if history_msgs:
+            recent_turns = history_msgs[-8:]
+            formatted_history = []
+            for m in recent_turns:
+                role = m.get("role", "unknown")
+                if role == "system":
+                    continue
+                content = str(m.get("content") or "").strip()
+                if len(content) > 1000:
+                    content = content[:500] + " ... [truncated]"
+                content = _redact_secrets(content)
+                tc = m.get("tool_calls")
+                tools_info = ""
+                if tc and isinstance(tc, list):
+                    names = [c.get("function", {}).get("name") for c in tc if isinstance(c, dict) and c.get("function")]
+                    names = [n for n in names if n]
+                    if names:
+                        tools_info = f" (called tools: {', '.join(names)})"
+                if content or tools_info:
+                    formatted_history.append(f"[{role}]{tools_info}: {content}")
+            if formatted_history:
+                user_prompt_parts.append("### Recent Conversation Dialogue:\n" + "\n\n".join(formatted_history))
 
         events_formatted = []
         for i, ev in enumerate(events, 1):
