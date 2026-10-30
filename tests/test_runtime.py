@@ -1,5 +1,6 @@
 """Unit tests for Hermes Advisor runtime helpers."""
 
+import os
 import sys
 import tempfile
 import unittest
@@ -557,16 +558,21 @@ class TestAdvisorRuntime(unittest.TestCase):
         rt = runtime_mod.AdvisorRuntime(ctx)
         rt.state.enabled = True
         dummy_secret = "sk-" + "c" * 24
-        res = rt.verify_turn(
-            draft="Clean, natural user response without plumbing.",
-            evidence=f"PID 1234, exit code 0, key={dummy_secret}.",
-            session_id="s_twoway"
-        )
-        self.assertEqual(res.get("status"), "approved")
-        self.assertIn("### Proposed User-Facing Response (Draft):\nClean, natural user response without plumbing.", ctx.llm.captured_prompt)
-        self.assertIn("### Technical Verification Evidence (Internal Notes for Auditor):\nPID 1234, exit code 0, key=[REDACTED SECRET].", ctx.llm.captured_prompt)
-        self.assertNotIn(dummy_secret, ctx.llm.captured_prompt)
-        self.assertIn("Natural Communication Style (SOUL.md)", ctx.llm.captured_prompt)
+        orig_no_review = os.environ.pop(runtime_mod.ADVISOR_NO_REVIEW, None)
+        try:
+            res = rt.verify_turn(
+                draft="Clean, natural user response without plumbing.",
+                evidence=f"PID 1234, exit code 0, key={dummy_secret}.",
+                session_id="s_twoway"
+            )
+            self.assertEqual(res.get("status"), "approved")
+            self.assertIn("### Proposed User-Facing Response (Draft):\nClean, natural user response without plumbing.", ctx.llm.captured_prompt)
+            self.assertIn("### Technical Verification Evidence (Internal Notes for Auditor):\nPID 1234, exit code 0, key=[REDACTED SECRET].", ctx.llm.captured_prompt)
+            self.assertNotIn(dummy_secret, ctx.llm.captured_prompt)
+            self.assertIn("Natural Communication Style (SOUL.md)", ctx.llm.captured_prompt)
+        finally:
+            if orig_no_review is not None:
+                os.environ[runtime_mod.ADVISOR_NO_REVIEW] = orig_no_review
 
 
 if __name__ == "__main__":
