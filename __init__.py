@@ -56,7 +56,11 @@ VERIFY_TURN_SCHEMA = {
             "properties": {
                 "draft": {
                     "type": "string",
-                    "description": "Your proposed final response or summary of actions taken.",
+                    "description": "Your natural, direct final response intended for the user (following SOUL.md: concise, plain claims, no robotic bureaucracy, no routine tool plumbing).",
+                },
+                "evidence": {
+                    "type": "string",
+                    "description": "Optional technical justification, tool citations, or internal verification notes for the auditor, keeping the draft clean for the user.",
                 },
                 "claims": {
                     "type": "array",
@@ -90,8 +94,9 @@ def _handle_verify_turn(args: dict | None = None, **kwargs) -> str:
     args = args or {}
     draft = args.get("draft", "")
     claims = args.get("claims", [])
+    evidence = args.get("evidence", "")
     session_id = kwargs.get("session_id", "")
-    res = runtime.verify_turn(draft=draft, claims=claims, session_id=session_id)
+    res = runtime.verify_turn(draft=draft, claims=claims, evidence=evidence, session_id=session_id)
     return json.dumps(res) if isinstance(res, dict) else str(res)
 
 
