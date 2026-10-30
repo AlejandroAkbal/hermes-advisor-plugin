@@ -574,6 +574,43 @@ class TestAdvisorRuntime(unittest.TestCase):
             if orig_no_review is not None:
                 os.environ[runtime_mod.ADVISOR_NO_REVIEW] = orig_no_review
 
+    def test_in_memory_conversation_history_caching_and_rendering(self):
+        class MockLLMResult:
+            text = '{"status": "approved", "reason": "Dialogue context verified"}'
+        class MockLLM:
+            def __init__(self):
+                self.captured_prompt: str = ""
+            def complete(self, **kw):
+                messages = kw.get("messages", [])
+                self.captured_prompt = "\n".join(m.get("content", "") for m in messages)
+                return MockLLMResult()
+        class MockCtx:
+            def __init__(self):
+                self.llm = MockLLM()
+
+        ctx = MockCtx()
+        rt = runtime_mod.AdvisorRuntime(ctx)
+        rt.state.enabled = True
+        
+        # Simulate Hermes passing live conversation history to on_pre_llm_call
+        live_history = [
+            {"role": "user", "content": "Can you check the server?"},
+            {"role": "assistant", "content": "Server is up.", "tool_calls": [{"function": {"name": "curl"}}]},
+            {"role": "user", "content": "What about the backup server?"}
+        ]
+        rt.on_pre_llm_call(session_id="s_mem", conversation_history=live_history)
+        
+        # Verify in-memory cache populated
+        self.assertEqual(len(rt._session_history.get("s_mem", [])), 3)
+
+        # verify_turn should use cached in-memory dialogue without touching DB
+        res = rt.verify_turn(draft="Backup server is healthy.", session_id="s_mem")
+        self.assertEqual(res.get("status"), "approved")
+        self.assertIn("### Recent Conversation Dialogue:", ctx.llm.captured_prompt)
+        self.assertIn("[user]: Can you check the server?", ctx.llm.captured_prompt)
+        self.assertIn("[assistant] (called tools: curl): Server is up.", ctx.llm.captured_prompt)
+        self.assertIn("[user]: What about the backup server?", ctx.llm.captured_prompt)
+
 
 if __name__ == "__main__":
     unittest.main()
