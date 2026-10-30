@@ -498,8 +498,15 @@ class AdvisorRuntime:
             return
         self._deliver_advice(advice_list, session_id=turn.session_id)
 
-    def on_session_finalize(self, **_kwargs) -> None:
-        """Give an in-flight review a small, fixed shutdown grace period."""
+    def on_session_finalize(self, session_id: str = "", **_kwargs) -> None:
+        """Clean up in-memory session caches and give in-flight reviews a small shutdown grace period."""
+        sess = session_id or "default"
+        with self._state_lock:
+            self._session_history.pop(sess, None)
+            self._turn_tool_events.pop(sess, None)
+            self._turn_verified.pop(sess, None)
+            self._session_states.pop(sess, None)
+
         if not self._idle.wait(SHUTDOWN_GRACE_SECONDS):
             logger.info(
                 "Advisor: review still running after %.1fs shutdown grace; "
@@ -717,7 +724,7 @@ class AdvisorRuntime:
         # Find the latest user query from history
         latest_user_query = ""
         for m in reversed(history_msgs):
-            if m.get("role") == "user":
+            if isinstance(m, dict) and m.get("role") == "user":
                 latest_user_query = m.get("content", "")
                 break
 
@@ -757,6 +764,8 @@ class AdvisorRuntime:
             recent_turns = history_msgs[-8:]
             formatted_history = []
             for m in recent_turns:
+                if not isinstance(m, dict):
+                    continue
                 role = m.get("role", "unknown")
                 if role == "system":
                     continue
