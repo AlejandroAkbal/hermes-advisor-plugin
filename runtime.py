@@ -713,11 +713,12 @@ class AdvisorRuntime:
         sess = session_id or "default"
         with self._state_lock:
             events = list(self._turn_tool_events.get(sess, []))
-            history_msgs = list(self._session_history.get(sess, []))
+            raw_history = list(self._session_history.get(sess, []))
+            history_msgs = [m for m in raw_history if isinstance(m, dict)]
 
         # Directives across the entire session from past human messages
         directives = self._session_user_directives(session_id)
-        # Recent conversation history fallback if memory cache not yet populated
+        # Recent conversation history fallback if memory cache not yet populated or has no valid dicts
         if not history_msgs:
             history_msgs = self._session_messages(session_id, limit=10)
 

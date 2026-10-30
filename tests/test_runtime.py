@@ -626,9 +626,14 @@ class TestAdvisorRuntime(unittest.TestCase):
 
         rt = runtime_mod.AdvisorRuntime(MockCtx())
         rt.state.enabled = True
+        
+        fallback_called = []
+        rt._session_messages = lambda sid, limit=10: fallback_called.append(sid) or [{"role": "user", "content": "from_db"}]
+        
         rt.on_pre_llm_call(session_id="s_nondict", conversation_history=["malformed_string_msg", None, 123])
         res = rt.verify_turn(draft="All clean.", session_id="s_nondict")
         self.assertEqual(res.get("status"), "approved")
+        self.assertIn("s_nondict", fallback_called, "Must fall back to database messages when in-memory cache has no valid dicts")
 
 
 if __name__ == "__main__":
