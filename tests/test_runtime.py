@@ -556,14 +556,16 @@ class TestAdvisorRuntime(unittest.TestCase):
         ctx = MockCtx()
         rt = runtime_mod.AdvisorRuntime(ctx)
         rt.state.enabled = True
+        dummy_secret = "sk-" + "c" * 24
         res = rt.verify_turn(
             draft="Clean, natural user response without plumbing.",
-            evidence="PID 1234, exit code 0, tab B38D94.",
+            evidence=f"PID 1234, exit code 0, key={dummy_secret}.",
             session_id="s_twoway"
         )
         self.assertEqual(res.get("status"), "approved")
         self.assertIn("### Proposed User-Facing Response (Draft):\nClean, natural user response without plumbing.", ctx.llm.captured_prompt)
-        self.assertIn("### Technical Verification Evidence (Internal Notes for Auditor):\nPID 1234, exit code 0, tab B38D94.", ctx.llm.captured_prompt)
+        self.assertIn("### Technical Verification Evidence (Internal Notes for Auditor):\nPID 1234, exit code 0, key=[REDACTED SECRET].", ctx.llm.captured_prompt)
+        self.assertNotIn(dummy_secret, ctx.llm.captured_prompt)
         self.assertIn("Natural Communication Style (SOUL.md)", ctx.llm.captured_prompt)
 
 
