@@ -300,6 +300,10 @@ def audit_draft_ledger(
             elif rule["name"] == "pr_merged" and matching_events:
                 cited_matches = list(rule["pattern"].finditer(scan_text))
                 for m in cited_matches:
+                    match_str = m.group(0).lower()
+                    is_action_claim = ("was merged" not in match_str and "is merged" not in match_str) and bool(
+                        re.search(r"\b(?:merged|merging)\s+(?:the\s+)?(?:new\s+|draft\s+)?(?:pr|pull request|#?\d+)\b", match_str)
+                    )
                     pr_num_m = re.search(r"(?i)\b(?:pr|pull request)\s+#?(\d+)\b", m.group(0))
                     claimed_num = pr_num_m.group(1) if pr_num_m else None
                     matching_success = False
@@ -307,8 +311,11 @@ def audit_draft_ledger(
                         res_str = str(ev.get("result", ""))
                         args_str = str(ev.get("args", ""))
                         if not _result_indicates_failure(res_str):
-                            if "gh pr view" in args_str and not re.search(r"(?i)\bmerged\b", res_str):
-                                continue
+                            if "gh pr view" in args_str:
+                                if is_action_claim:
+                                    continue
+                                if not re.search(r"""(?i)["']?state["']?\s*[:=]\s*["']?merged["']?|\bstate:\s*merged\b""", res_str):
+                                    continue
                             if claimed_num is None:
                                 matching_success = True
                                 break
@@ -318,8 +325,12 @@ def audit_draft_ledger(
                                 break
                     if not matching_success:
                         if claimed_num:
-                            missing_checks.append(f"Verify PR #{claimed_num} merge via `gh pr view {claimed_num}`.")
-                            unbacked_reasons.append(f"No successful `gh pr merge` or `gh pr view` event corroborated merging PR #{claimed_num}.")
+                            if is_action_claim:
+                                missing_checks.append(f"Verify PR #{claimed_num} merge action via `gh pr merge {claimed_num}`.")
+                                unbacked_reasons.append(f"No successful `gh pr merge` event corroborated merging PR #{claimed_num}.")
+                            else:
+                                missing_checks.append(f"Verify PR #{claimed_num} merge via `gh pr view {claimed_num}`.")
+                                unbacked_reasons.append(f"No successful `gh pr merge` or `gh pr view` event corroborated merged status for PR #{claimed_num}.")
                         else:
                             missing_checks.append("Verify PR merge via `gh pr merge` or `gh pr view`.")
                             unbacked_reasons.append("Tool `gh pr merge` or `gh pr view` failed or did not confirm merge.")

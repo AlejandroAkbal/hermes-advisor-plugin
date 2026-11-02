@@ -328,6 +328,20 @@ class TestDeterministicLedger(unittest.TestCase):
         )
         self.assertFalse(v_view_open.passed)
 
+        # Failed PR merge corroboration via gh pr view with misleading title containing 'merged'
+        v_view_title_mislead = audit_draft_ledger(
+            "PR #19 was merged into main.",
+            tool_events=[{"tool": "terminal", "args": "gh pr view 19 --json state,title", "result": '{"state":"OPEN","title":"Not merged yet"}'}]
+        )
+        self.assertFalse(v_view_title_mislead.passed)
+
+        # gh pr view cannot corroborate an active merge action claim
+        v_action_denied = audit_draft_ledger(
+            "Merged PR #19 successfully.",
+            tool_events=[{"tool": "terminal", "args": "gh pr view 19 --json state", "result": '{"state":"MERGED"}'}]
+        )
+        self.assertFalse(v_action_denied.passed)
+
         # Attribution lookbehind: reporting on cron/log past PR actions
         v_cron_report = audit_draft_ledger(
             "The cron opened PR #15 and the cron merged PR #15 earlier.",
