@@ -307,12 +307,33 @@ class TestDeterministicLedger(unittest.TestCase):
         )
         self.assertFalse(v_mismatch.passed)
 
-        # Successful PR merge
+        # Successful PR merge via gh pr merge
         v_ok = audit_draft_ledger(
             "Merged PR #19 successfully.",
             tool_events=[{"tool": "terminal", "args": "gh pr merge 19 --admin", "result": "Merged PR #19 (AlejandroAkbal/hermes-advisor-plugin)"}]
         )
         self.assertTrue(v_ok.passed)
+
+        # Successful PR merge corroborated via gh pr view
+        v_view_ok = audit_draft_ledger(
+            "PR #19 was merged into main.",
+            tool_events=[{"tool": "terminal", "args": "gh pr view 19 --json state", "result": '{"state":"MERGED"}'}]
+        )
+        self.assertTrue(v_view_ok.passed)
+
+        # Failed PR merge corroboration via gh pr view (still OPEN)
+        v_view_open = audit_draft_ledger(
+            "PR #19 was merged into main.",
+            tool_events=[{"tool": "terminal", "args": "gh pr view 19 --json state", "result": '{"state":"OPEN"}'}]
+        )
+        self.assertFalse(v_view_open.passed)
+
+        # Attribution lookbehind: reporting on cron/log past PR actions
+        v_cron_report = audit_draft_ledger(
+            "The cron opened PR #15 and the cron merged PR #15 earlier.",
+            tool_events=[]
+        )
+        self.assertTrue(v_cron_report.passed)
 
     def test_corroboration_rule_catches_failed_test_suite(self):
         # Failed test suite with 'all tests pass' claim

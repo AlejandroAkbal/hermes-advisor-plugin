@@ -56,9 +56,10 @@ _CORROBORATION_RULES = [
         "name": "pr_created",
         "pattern": re.compile(
             r"(?i)(?<!make sure )(?<!ensure )(?<!verify )(?<!if )(?<!to )(?<!will )(?<!not )(?<!yet )(?<!n't )(?<!never )(?<!haven't )(?<!hasn't )(?<!hadn't )(?<!without )(?<!yet to )"
+            r"(?<!cron )(?<!log )(?<!earlier )(?<!prior )"
             r"\b(?:(?:opened|created|submitted)\s+(?:a\s+|the\s+)?(?:new\s+|draft\s+)?pr(?: #?\d+)?"
             r"|(?:opened|created|submitted)\s+(?:a\s+|the\s+)?(?:new\s+|draft\s+)?pull request(?: #?\d+)?"
-            r"|(?<!no )(?<!not )(?<!n't )(?<!never )(?<!yet )pr #?\d+\s+(?:was |is )?(?:opened|created))\b"
+            r"|(?<!no )(?<!not )(?<!n't )(?<!never )(?<!yet )(?<!cron )(?<!log )pr #?\d+\s+(?:was |is )?(?:opened|created))\b"
         ),
         "required_tool_patterns": [r"\bgh\s+pr\s+create\b"],
         "suggested_command": "Run `gh pr create` before claiming a PR was created or opened.",
@@ -67,12 +68,13 @@ _CORROBORATION_RULES = [
         "name": "pr_merged",
         "pattern": re.compile(
             r"(?i)(?<!make sure )(?<!ensure )(?<!verify )(?<!if )(?<!to )(?<!will )(?<!not )(?<!n't )(?<!never )(?<!without )"
+            r"(?<!cron )(?<!log )(?<!earlier )(?<!prior )"
             r"\b(?:(?:merged|merging)\s+(?:the\s+)?(?:new\s+|draft\s+)?(?:pr|pull request)(?:\s+#?\d+)?"
-            r"|(?:pr|pull request)\s+#?\d+\s+(?:was\s+|is\s+)?merged"
+            r"|(?<!cron )(?<!log )(?<!earlier )(?<!prior )(?:pr|pull request)\s+#?\d+\s+(?:was\s+|is\s+)?merged"
             r"|(?:automatically\s+)?merged\s+the\s+pr\b"
             r")\b"
         ),
-        "required_tool_patterns": [r"\bgh\s+pr\s+merge\b"],
+        "required_tool_patterns": [r"\bgh\s+pr\s+merge\b", r"\bgh\s+pr\s+view\b"],
         "suggested_command": "Verify PR merge via `gh pr merge` or `gh pr view`.",
     },
     {
@@ -144,8 +146,8 @@ def _extract_created_pr_number(args_str: str, res_str: str) -> str | None:
 
 
 def _extract_merged_pr_number(args_str: str, res_str: str) -> str | None:
-    """Extract actual merged PR number from gh pr merge command arguments or URL."""
-    arg_m = re.search(r"\bgh\s+pr\s+merge\s+(?:--[a-z0-9_-]+(?:\s+[^\s]+)?\s+)*#?(\d+)\b", args_str)
+    """Extract actual merged PR number from gh pr merge/view command arguments or URL."""
+    arg_m = re.search(r"\bgh\s+pr\s+(?:merge|view)\s+(?:--[a-z0-9_-]+(?:\s+[^\s]+)?\s+)*#?(\d+)\b", args_str)
     if arg_m:
         return arg_m.group(1)
     url_m = re.search(r"https?://github\.com/[^/\s]+/[^/\s]+/pull/(\d+)", res_str)
@@ -305,6 +307,8 @@ def audit_draft_ledger(
                         res_str = str(ev.get("result", ""))
                         args_str = str(ev.get("args", ""))
                         if not _result_indicates_failure(res_str):
+                            if "gh pr view" in args_str and not re.search(r"(?i)\bmerged\b", res_str):
+                                continue
                             if claimed_num is None:
                                 matching_success = True
                                 break
@@ -315,10 +319,10 @@ def audit_draft_ledger(
                     if not matching_success:
                         if claimed_num:
                             missing_checks.append(f"Verify PR #{claimed_num} merge via `gh pr view {claimed_num}`.")
-                            unbacked_reasons.append(f"No successful `gh pr merge` event corroborated merging PR #{claimed_num}.")
+                            unbacked_reasons.append(f"No successful `gh pr merge` or `gh pr view` event corroborated merging PR #{claimed_num}.")
                         else:
-                            missing_checks.append("Verify `gh pr merge` succeeded before claiming a PR was merged.")
-                            unbacked_reasons.append("Tool `gh pr merge` failed to merge.")
+                            missing_checks.append("Verify PR merge via `gh pr merge` or `gh pr view`.")
+                            unbacked_reasons.append("Tool `gh pr merge` or `gh pr view` failed or did not confirm merge.")
 
             elif rule["name"] == "git_committed" and matching_events:
                 latest_commit = matching_events[-1]
