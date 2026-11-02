@@ -164,6 +164,9 @@ def _extract_merged_pr_number(args_str: str, res_str: str) -> str | None:
     arg_m = re.search(r"\bgh\s+pr\s+(?:merge|view)\s+(?:--[a-z0-9_-]+(?:\s+[^\s]+)?\s+)*#?(\d+)\b", args_str)
     if arg_m:
         return arg_m.group(1)
+    arg_url_m = re.search(r"\bgh\s+pr\s+(?:merge|view)\s+.*?https?://github\.com/[^/\s]+/[^/\s]+/pull/(\d+)", args_str)
+    if arg_url_m:
+        return arg_url_m.group(1)
     res_clean = res_str.strip()
     if res_clean.startswith("{") and res_clean.endswith("}"):
         try:

@@ -349,6 +349,13 @@ class TestDeterministicLedger(unittest.TestCase):
         )
         self.assertTrue(v_view_ws.passed)
 
+        # Successful PR merge corroborated via gh pr view with full pull request URL
+        v_view_url = audit_draft_ledger(
+            "PR #19 was merged into main.",
+            tool_events=[{"tool": "terminal", "args": "gh pr view https://github.com/AlejandroAkbal/hermes-advisor-plugin/pull/19 --json state", "result": '{"state":"MERGED"}'}]
+        )
+        self.assertTrue(v_view_url.passed)
+
         # Unrelated PR view with title mentioning PR #19 cannot corroborate PR #19
         v_view_unrelated = audit_draft_ledger(
             "PR #19 was merged into main.",
