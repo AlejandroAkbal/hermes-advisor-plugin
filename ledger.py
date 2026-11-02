@@ -9,6 +9,7 @@ Provides zero-latency, deterministic static verification of drafts before callin
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
@@ -145,17 +146,39 @@ def _extract_created_pr_number(args_str: str, res_str: str) -> str | None:
     return None
 
 
+def _pr_view_indicates_merged(res_str: str) -> bool:
+    """Authoritatively check if gh pr view output indicates MERGED state."""
+    res_clean = res_str.strip()
+    if res_clean.startswith("{") and res_clean.endswith("}"):
+        try:
+            data = json.loads(res_clean)
+            if isinstance(data, dict):
+                return str(data.get("state", "")).upper() == "MERGED"
+        except Exception:
+            pass
+    return bool(re.search(r"(?im)^\s*state:\s*merged\s*$", res_str))
+
+
 def _extract_merged_pr_number(args_str: str, res_str: str) -> str | None:
     """Extract actual merged PR number from gh pr merge/view command arguments or URL."""
     arg_m = re.search(r"\bgh\s+pr\s+(?:merge|view)\s+(?:--[a-z0-9_-]+(?:\s+[^\s]+)?\s+)*#?(\d+)\b", args_str)
     if arg_m:
         return arg_m.group(1)
-    url_m = re.search(r"https?://github\.com/[^/\s]+/[^/\s]+/pull/(\d+)", res_str)
-    if url_m:
-        return url_m.group(1)
-    res_m = re.search(r"(?i)\b(?:merged\s+)?(?:pr|pull request)\s+#?(\d+)\b", res_str)
-    if res_m:
-        return res_m.group(1)
+    res_clean = res_str.strip()
+    if res_clean.startswith("{") and res_clean.endswith("}"):
+        try:
+            data = json.loads(res_clean)
+            if isinstance(data, dict) and "number" in data:
+                return str(data["number"])
+        except Exception:
+            pass
+    if re.search(r"\bgh\s+pr\s+merge\b", args_str):
+        url_m = re.search(r"https?://github\.com/[^/\s]+/[^/\s]+/pull/(\d+)", res_str)
+        if url_m:
+            return url_m.group(1)
+        res_m = re.search(r"(?i)\b(?:merged\s+)?(?:pr|pull request)\s+#?(\d+)\b", res_str)
+        if res_m:
+            return res_m.group(1)
     return None
 
 
@@ -311,10 +334,10 @@ def audit_draft_ledger(
                         res_str = str(ev.get("result", ""))
                         args_str = str(ev.get("args", ""))
                         if not _result_indicates_failure(res_str):
-                            if "gh pr view" in args_str:
+                            if re.search(r"\bgh\s+pr\s+view\b", args_str):
                                 if is_action_claim:
                                     continue
-                                if not re.search(r"""(?i)["']?state["']?\s*[:=]\s*["']?merged["']?|\bstate:\s*merged\b""", res_str):
+                                if not _pr_view_indicates_merged(res_str):
                                     continue
                             if claimed_num is None:
                                 matching_success = True

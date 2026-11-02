@@ -342,6 +342,20 @@ class TestDeterministicLedger(unittest.TestCase):
         )
         self.assertFalse(v_action_denied.passed)
 
+        # Successful PR merge corroborated via gh pr view with whitespace variation
+        v_view_ws = audit_draft_ledger(
+            "PR #19 was merged into main.",
+            tool_events=[{"tool": "terminal", "args": "gh  pr  view 19 --json state", "result": '{"state":"MERGED"}'}]
+        )
+        self.assertTrue(v_view_ws.passed)
+
+        # Unrelated PR view with title mentioning PR #19 cannot corroborate PR #19
+        v_view_unrelated = audit_draft_ledger(
+            "PR #19 was merged into main.",
+            tool_events=[{"tool": "terminal", "args": "gh pr view 25 --json state,title", "result": '{"number":25,"state":"MERGED","title":"Fix follow-up for PR #19"}'}]
+        )
+        self.assertFalse(v_view_unrelated.passed)
+
         # Attribution lookbehind: reporting on cron/log past PR actions
         v_cron_report = audit_draft_ledger(
             "The cron opened PR #15 and the cron merged PR #15 earlier.",
