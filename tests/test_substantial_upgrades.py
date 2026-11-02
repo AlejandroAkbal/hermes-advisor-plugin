@@ -1,6 +1,8 @@
 """Unit tests for substantial verifier upgrades: ledger, prober, dialectic."""
 
 import os
+import shutil
+import socket
 import subprocess
 import tempfile
 import unittest
@@ -556,18 +558,29 @@ class TestActiveProber(unittest.TestCase):
             self.assertFalse(any("3.5" in p.claim for p in probes_neg))
             self.assertFalse(any("Node.js" in p.claim for p in probes_neg))
 
+    @unittest.skipUnless(shutil.which("lsof"), "lsof not available")
     def test_probe_port_listening(self):
         # Invalid port
         res_invalid = probe_port_listening(999999)
         self.assertFalse(res_invalid.executed)
         self.assertFalse(res_invalid.success)
 
-        # Unbound high port
-        res_unbound = probe_port_listening(59999)
-        self.assertTrue(res_unbound.executed)
-        self.assertFalse(res_unbound.success)
-        self.assertIn("no process listening", res_unbound.output)
+        # Listening port via ephemeral loopback socket
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
+            srv.bind(("127.0.0.1", 0))
+            srv.listen(1)
+            port = srv.getsockname()[1]
+            res_listen = probe_port_listening(port)
+            self.assertTrue(res_listen.executed)
+            self.assertTrue(res_listen.success)
 
+        # Once socket is closed, port is unbound
+        res_unbound = probe_port_listening(port)
+        if res_unbound.executed:
+            self.assertFalse(res_unbound.success)
+            self.assertIn("no process listening", res_unbound.output)
+
+    @unittest.skipUnless(shutil.which("ps"), "ps not available")
     def test_probe_process_running(self):
         # Invalid PID
         res_invalid = probe_process_running(-1)
@@ -582,7 +595,7 @@ class TestActiveProber(unittest.TestCase):
         self.assertIn(str(current_pid), res_current.output)
 
         # Non-existent PID
-        res_dead = probe_process_running(999998)
+        res_dead = probe_process_running(99998)
         self.assertTrue(res_dead.executed)
         self.assertFalse(res_dead.success)
 
@@ -614,10 +627,9 @@ class TestActiveProber(unittest.TestCase):
             self.assertFalse(res_bad.success)
 
     def test_probe_service_running_not_found(self):
+        # Service absent from caller's launchctl domain safely returns None rather than false CONTRADICTED
         res = probe_service_running("com.nonexistent.service.xyz.12345")
-        if res is not None and res.executed:
-            self.assertFalse(res.success)
-            self.assertIn("not found in launchctl list", res.output)
+        self.assertIsNone(res)
 
     def test_run_active_probes_for_port_pid_and_commit(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -634,16 +646,19 @@ class TestActiveProber(unittest.TestCase):
 
             cur_pid = os.getpid()
             draft = (
-                f"The updater is running (PID {cur_pid}), bound to port 59999, "
-                f"committed in {short_sha}, and service com.logi.optionsplus.updater is running."
+                f"The updater is running (PID {cur_pid}), bound to port 59999, listening on 192.168.1.10:8080, "
+                f"committed in {short_sha}, and service com.logi.optionsplus.updater. is running."
             )
             probes = run_active_probes_for_draft(draft, tmp_dir)
 
             claims = [p.claim for p in probes]
             self.assertTrue(any(f"PID {cur_pid}" in c for c in claims))
             self.assertTrue(any("port 59999" in c for c in claims))
+            self.assertTrue(any("port 8080" in c for c in claims))
+            self.assertFalse(any("port 192" in c for c in claims))
             self.assertTrue(any(f"commit {short_sha}" in c for c in claims))
-            self.assertTrue(any("com.logi.optionsplus.updater" in c for c in claims))
+            # Service label should have trailing dot stripped
+            self.assertFalse(any("updater." in c for c in claims))
 
             # The current PID and commit should be successful
             pid_probe = next(p for p in probes if f"PID {cur_pid}" in p.claim)

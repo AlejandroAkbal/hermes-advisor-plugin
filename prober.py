@@ -39,21 +39,26 @@ class ProbeResult:
         return f"[Active Probe {status_str}]: `{self.command}` -> {self.output[:200]}"
 
 
+def _is_git_work_tree(cwd: str) -> bool:
+    """Check safely whether cwd is inside a git working tree."""
+    if os.path.isdir(os.path.join(cwd, ".git")):
+        return True
+    try:
+        res = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--is-inside-work-tree"],
+            capture_output=True,
+            text=True,
+            timeout=PROBE_TIMEOUT_SECONDS,
+        )
+        return res.returncode == 0 and res.stdout.strip() == "true"
+    except Exception:
+        return False
+
+
 def probe_git_clean_status(cwd: str) -> ProbeResult | None:
     """Safely probe if working tree is clean."""
-    if not os.path.isdir(os.path.join(cwd, ".git")):
-        # Check if parent is git
-        try:
-            res = subprocess.run(
-                ["git", "-C", cwd, "rev-parse", "--is-inside-work-tree"],
-                capture_output=True,
-                text=True,
-                timeout=PROBE_TIMEOUT_SECONDS,
-            )
-            if res.returncode != 0:
-                return None
-        except Exception:
-            return None
+    if not _is_git_work_tree(cwd):
+        return None
 
     try:
         proc = subprocess.run(
@@ -85,18 +90,8 @@ def probe_git_clean_status(cwd: str) -> ProbeResult | None:
 
 def probe_git_branch(cwd: str) -> ProbeResult | None:
     """Safely probe current git branch."""
-    if not os.path.isdir(os.path.join(cwd, ".git")):
-        try:
-            res = subprocess.run(
-                ["git", "-C", cwd, "rev-parse", "--is-inside-work-tree"],
-                capture_output=True,
-                text=True,
-                timeout=PROBE_TIMEOUT_SECONDS,
-            )
-            if res.returncode != 0:
-                return None
-        except Exception:
-            return None
+    if not _is_git_work_tree(cwd):
+        return None
 
     try:
         proc = subprocess.run(
@@ -109,8 +104,8 @@ def probe_git_branch(cwd: str) -> ProbeResult | None:
             branch = proc.stdout.strip()
             return ProbeResult(
                 executed=True,
-                success=bool(branch),
-                claim=f"current git branch: {branch}",
+                success=True,
+                claim="current git branch",
                 command=f"git -C {cwd} branch --show-current",
                 output=branch,
             )
@@ -159,21 +154,10 @@ def probe_service_running(label: str) -> ProbeResult | None:
                         command=f"launchctl list | grep {label}",
                         output=f"entry={line.strip()} (alive={is_alive})",
                     )
-            return ProbeResult(
-                executed=True,
-                success=False,
-                claim=f"service {label} running",
-                command=f"launchctl list | grep {label}",
-                output=f"service {label} not found in launchctl list",
-            )
-    except Exception as e:
-        return ProbeResult(
-            executed=False,
-            success=False,
-            claim=f"service {label} running",
-            command=f"launchctl list | grep {label}",
-            output=f"Probe inconclusive: {e}",
-        )
+            # Not found in caller's launchctl domain (may exist in system domain or another session)
+            return None
+    except Exception:
+        pass
     return None
 
 
@@ -208,12 +192,20 @@ def probe_port_listening(port: int) -> ProbeResult:
                     command=f"lsof -iTCP:{port} -sTCP:LISTEN -n -P",
                     output=lines[0],
                 )
+        if proc.returncode == 1 and not proc.stderr.strip():
+            return ProbeResult(
+                executed=True,
+                success=False,
+                claim=f"port {port} listening",
+                command=f"lsof -iTCP:{port} -sTCP:LISTEN -n -P",
+                output=f"no process listening on port {port}",
+            )
         return ProbeResult(
-            executed=True,
+            executed=False,
             success=False,
             claim=f"port {port} listening",
             command=f"lsof -iTCP:{port} -sTCP:LISTEN -n -P",
-            output=f"no process listening on port {port}",
+            output=f"Probe inconclusive: lsof exit code {proc.returncode} {proc.stderr.strip()}".strip(),
         )
     except Exception as e:
         return ProbeResult(
@@ -227,7 +219,7 @@ def probe_port_listening(port: int) -> ProbeResult:
 
 def probe_process_running(pid: int) -> ProbeResult:
     """Safely probe if a process with given PID is running on the host."""
-    if pid <= 0 or pid > 999999:
+    if pid <= 0 or pid > 99999:
         return ProbeResult(
             executed=False,
             success=False,
@@ -250,6 +242,14 @@ def probe_process_running(pid: int) -> ProbeResult:
                 command=f"ps -p {pid} -o pid=,user=,comm=",
                 output=proc.stdout.strip(),
             )
+        if proc.returncode != 0 and proc.stderr.strip():
+            return ProbeResult(
+                executed=False,
+                success=False,
+                claim=f"process PID {pid} running",
+                command=f"ps -p {pid} -o pid=,user=,comm=",
+                output=f"Probe inconclusive: {proc.stderr.strip()}",
+            )
         return ProbeResult(
             executed=True,
             success=False,
@@ -269,18 +269,8 @@ def probe_process_running(pid: int) -> ProbeResult:
 
 def probe_git_commit(commit_ref: str, cwd: str) -> ProbeResult | None:
     """Safely probe if a git commit hash exists in the repository."""
-    if not os.path.isdir(os.path.join(cwd, ".git")):
-        try:
-            res = subprocess.run(
-                ["git", "-C", cwd, "rev-parse", "--is-inside-work-tree"],
-                capture_output=True,
-                text=True,
-                timeout=PROBE_TIMEOUT_SECONDS,
-            )
-            if res.returncode != 0:
-                return None
-        except Exception:
-            return None
+    if not _is_git_work_tree(cwd):
+        return None
 
     try:
         proc = subprocess.run(
@@ -335,15 +325,16 @@ def run_active_probes_for_draft(draft: str, cwd: str) -> list[ProbeResult]:
         draft,
     )
     found_labels += re.findall(
-        r"(?i)\b([a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_.-]+)+)\s+(?:service|daemon)?\s+(?:is\s+)?(?:running|alive|active|restarted)\b",
+        r"(?i)\b([a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_.-]+)+)(?:\s+(?:service|daemon))?\s+(?:is\s+)?(?:running|alive|active|restarted)\b",
         draft,
     )
     ignored_label_extensions = {
-        "com", "org", "net", "io", "dev", "app", "js", "py", "json", "yml", "yaml", "md", "txt", "html", "sh", "ts"
+        "com", "org", "net", "io", "dev", "app", "js", "py", "json", "yml", "yaml", "md", "txt", "html", "sh", "ts", "log", "conf", "cfg"
     }
     for lbl in found_labels:
+        lbl = lbl.rstrip(".")
         parts = lbl.lower().split(".")
-        if parts[-1] not in ignored_label_extensions:
+        if len(parts) >= 2 and parts[-1] not in ignored_label_extensions:
             service_labels.add(lbl)
 
     for lbl in service_labels:
@@ -388,7 +379,7 @@ def run_active_probes_for_draft(draft: str, cwd: str) -> list[ProbeResult]:
 
     # 5. Probe TCP port listening if explicitly asserted
     port_matches = re.findall(
-        r"(?i)\b(?:listening\s+(?:on|at)\s+(?:port\s+)?(?:(?:127\.0\.0\.1|0\.0\.0\.0|localhost):)?(\d{2,5})|bound\s+to\s+(?:port\s+)?(?:(?:127\.0\.0\.1|0\.0\.0\.0|localhost):)?(\d{2,5})|port\s+(\d{2,5})\s+(?:is\s+)?(?:listening|open))\b",
+        r"(?i)\b(?:listening\s+(?:on|at)\s+(?:port\s+)?(?:(?:\d{1,3}(?:\.\d{1,3}){3}|localhost):)?(\d{2,5})(?!\.\d)|bound\s+to\s+(?:port\s+)?(?:(?:\d{1,3}(?:\.\d{1,3}){3}|localhost):)?(\d{2,5})(?!\.\d)|port\s+(\d{2,5})\s+(?:is\s+)?(?:listening|open))\b",
         draft,
     )
     seen_ports: set[int] = set()
@@ -410,7 +401,7 @@ def run_active_probes_for_draft(draft: str, cwd: str) -> list[ProbeResult]:
         for pid_str in match_tuple:
             if pid_str and pid_str.isdigit():
                 pid_num = int(pid_str)
-                if 1 <= pid_num <= 999999 and pid_num not in seen_pids:
+                if 1 <= pid_num <= 99999 and pid_num not in seen_pids:
                     seen_pids.add(pid_num)
                     probes.append(probe_process_running(pid_num))
 
