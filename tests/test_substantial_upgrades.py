@@ -346,6 +346,34 @@ class TestDeterministicLedger(unittest.TestCase):
         )
         self.assertFalse(v_multi_merge.passed)
 
+    def test_probe_text_does_not_corroborate_test_suite_execution(self):
+        # Arbitrary probe evidence containing 'pytest' must not corroborate a test run without a tool event
+        v = audit_draft_ledger(
+            "All tests pass.",
+            tool_events=[],
+            evidence="[Active Probe CONFIRMED]: test -e /tmp/pytest.log -> exists=True"
+        )
+        self.assertFalse(v.passed)
+        self.assertEqual(v.rule, "unbacked_assertion")
+
+    def test_multiple_cited_prs_must_all_be_corroborated(self):
+        # Draft cites two merged PRs, but only one was merged
+        v = audit_draft_ledger(
+            "Merged PR #19 and merged PR #20 successfully.",
+            tool_events=[{"tool": "terminal", "args": "gh pr merge 19 --admin", "result": "https://github.com/org/repo/pull/19"}]
+        )
+        self.assertFalse(v.passed)
+        self.assertIn("PR #20", v.reason)
+
+    def test_operation_identity_avoids_spurious_pr_number_matches(self):
+        # PR title cites #99, but actual PR created was #15
+        v = audit_draft_ledger(
+            "Opened PR #99.",
+            tool_events=[{"tool": "terminal", "args": "gh pr create --title 'Follow-up to PR #99'", "result": "https://github.com/org/repo/pull/15"}]
+        )
+        self.assertFalse(v.passed)
+        self.assertIn("PR #99", v.reason)
+
     def test_evidence_parameter_is_checked_in_corroboration(self):
         # Corroborating evidence supplied in evidence parameter (e.g. from active probes)
         v = audit_draft_ledger(
@@ -426,6 +454,19 @@ class TestActiveProber(unittest.TestCase):
             assert file_probe is not None
             self.assertTrue(branch_probe.success)
             self.assertTrue(file_probe.success)
+
+            # Test path before exists: 'artifact.json exists'
+            json_file = os.path.join(tmp_dir, "config.json")
+            with open(json_file, "w") as f:
+                f.write("{}")
+            draft_pre = f"{json_file} exists in the directory."
+            probes_pre = run_active_probes_for_draft(draft_pre, tmp_dir)
+            self.assertTrue(any("config.json" in p.claim and p.success for p in probes_pre))
+
+            # Test non-branch phrasing 'on Linux' does not trigger false branch probe
+            draft_os = "All tests pass on Linux."
+            probes_os = run_active_probes_for_draft(draft_os, tmp_dir)
+            self.assertFalse(any("branch" in p.claim for p in probes_os))
 
 
 class TestDialecticAuditor(unittest.TestCase):

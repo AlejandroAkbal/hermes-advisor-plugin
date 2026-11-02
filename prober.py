@@ -176,8 +176,11 @@ def run_active_probes_for_draft(draft: str, cwd: str) -> list[ProbeResult]:
         if res:
             probes.append(res)
 
-    # 3. Probe git branch if claimed
-    branch_m = re.search(r"(?i)\b(?:on|switched to|checked out|on feature|on branch)\s+(?:branch\s+)?([a-zA-Z0-9_\-\.\/]+)\b", draft)
+    # 3. Probe git branch if claimed with explicit branch wording
+    branch_m = re.search(
+        r"(?i)\b(?:switched to branch|checked out branch|on feature branch|on feature|on branch)\s+(?:branch\s+)?([a-zA-Z0-9_\-\.\/]+)\b",
+        draft,
+    )
     if branch_m:
         claimed_branch = branch_m.group(1).strip()
         if claimed_branch.lower() not in {"the", "a", "an", "our", "this", "that", "clean", "dirty"}:
@@ -188,11 +191,15 @@ def run_active_probes_for_draft(draft: str, cwd: str) -> list[ProbeResult]:
                 probes.append(res)
 
     # 4. Probe file existence if explicit file creation or existence is asserted with a file path
-    file_matches = re.findall(
+    post_verb_matches = re.findall(
         r"(?i)(?:created|written|saved|added|exists?)\s+(?:in|to|at)?\s*[`'\"]?([/~a-zA-Z0-9_\-./]+(?:\.[a-zA-Z0-9_\-]+))[`'\"]?",
         draft,
     )
-    for p in file_matches:
+    pre_verb_matches = re.findall(
+        r"(?i)[`'\"]?([/~a-zA-Z0-9_\-./]+(?:\.[a-zA-Z0-9_\-]+))[`'\"]?\s+exists?\b",
+        draft,
+    )
+    for p in set(post_verb_matches + pre_verb_matches):
         expanded_path = os.path.expanduser(p)
         if not os.path.isabs(expanded_path):
             expanded_path = os.path.abspath(os.path.join(cwd, expanded_path))
