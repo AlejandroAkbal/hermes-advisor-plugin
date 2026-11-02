@@ -6,6 +6,7 @@ import socket
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 try:
     from hermes_plugins.advisor.dialectic import DialecticAuditor, parse_json_safely
     from hermes_plugins.advisor.ledger import audit_draft_ledger
@@ -595,9 +596,14 @@ class TestActiveProber(unittest.TestCase):
         self.assertIn(str(current_pid), res_current.output)
 
         # Non-existent PID
-        res_dead = probe_process_running(99998)
-        self.assertTrue(res_dead.executed)
-        self.assertFalse(res_dead.success)
+        with unittest.mock.patch.object(
+            subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess(args=["ps"], returncode=1, stdout="", stderr=""),
+        ):
+            res_dead = probe_process_running(99998)
+            self.assertTrue(res_dead.executed)
+            self.assertFalse(res_dead.success)
 
     def test_probe_git_commit(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -631,6 +637,7 @@ class TestActiveProber(unittest.TestCase):
         res = probe_service_running("com.nonexistent.service.xyz.12345")
         self.assertIsNone(res)
 
+    @unittest.skipUnless(shutil.which("ps"), "ps not available")
     def test_run_active_probes_for_port_pid_and_commit(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             subprocess.run(["git", "init"], cwd=tmp_dir, check=True, capture_output=True)
@@ -649,7 +656,14 @@ class TestActiveProber(unittest.TestCase):
                 f"The updater is running (PID {cur_pid}), bound to port 59999, listening on 192.168.1.10:8080, "
                 f"committed in {short_sha}, and service com.logi.optionsplus.updater. is running."
             )
-            probes = run_active_probes_for_draft(draft, tmp_dir)
+            with unittest.mock.patch(
+                f"{run_active_probes_for_draft.__module__}.probe_service_running",
+                return_value=None,
+            ) as mock_svc:
+                probes = run_active_probes_for_draft(draft, tmp_dir)
+
+            mock_svc.assert_any_call("com.logi.optionsplus.updater")
+            self.assertNotIn("com.logi.optionsplus.updater.", [c.args[0] for c in mock_svc.call_args_list])
 
             claims = [p.claim for p in probes]
             self.assertTrue(any(f"PID {cur_pid}" in c for c in claims))
@@ -657,8 +671,6 @@ class TestActiveProber(unittest.TestCase):
             self.assertTrue(any("port 8080" in c for c in claims))
             self.assertFalse(any("port 192" in c for c in claims))
             self.assertTrue(any(f"commit {short_sha}" in c for c in claims))
-            # Service label should have trailing dot stripped
-            self.assertFalse(any("updater." in c for c in claims))
 
             # The current PID and commit should be successful
             pid_probe = next(p for p in probes if f"PID {cur_pid}" in p.claim)

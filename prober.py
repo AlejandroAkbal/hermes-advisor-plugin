@@ -17,10 +17,12 @@ from __future__ import annotations
 
 import os
 import re
+import socket
 import subprocess
 from typing import Any
 
 PROBE_TIMEOUT_SECONDS = 2.0
+PID_LIMIT = 4_194_304  # Linux pid_max ceiling; pid_max itself is not allocated
 
 
 class ProbeResult:
@@ -193,13 +195,32 @@ def probe_port_listening(port: int) -> ProbeResult:
                     output=lines[0],
                 )
         if proc.returncode == 1 and not proc.stderr.strip():
-            return ProbeResult(
-                executed=True,
-                success=False,
-                claim=f"port {port} listening",
-                command=f"lsof -iTCP:{port} -sTCP:LISTEN -n -P",
-                output=f"no process listening on port {port}",
-            )
+            # lsof hides sockets of processes owned by other users; cross-check with a connect.
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                    return ProbeResult(
+                        executed=True,
+                        success=True,
+                        claim=f"port {port} listening",
+                        command=f"lsof -iTCP:{port} -sTCP:LISTEN -n -P",
+                        output=f"127.0.0.1:{port} accepts connections (listener not visible to lsof)",
+                    )
+            except ConnectionRefusedError:
+                return ProbeResult(
+                    executed=True,
+                    success=False,
+                    claim=f"port {port} listening",
+                    command=f"lsof -iTCP:{port} -sTCP:LISTEN -n -P",
+                    output=f"no process listening on port {port}",
+                )
+            except OSError as e:
+                return ProbeResult(
+                    executed=False,
+                    success=False,
+                    claim=f"port {port} listening",
+                    command=f"lsof -iTCP:{port} -sTCP:LISTEN -n -P",
+                    output=f"Probe inconclusive: lsof found no visible listener; {e}",
+                )
         return ProbeResult(
             executed=False,
             success=False,
@@ -219,7 +240,7 @@ def probe_port_listening(port: int) -> ProbeResult:
 
 def probe_process_running(pid: int) -> ProbeResult:
     """Safely probe if a process with given PID is running on the host."""
-    if pid <= 0 or pid > 99999:
+    if pid <= 0 or pid >= PID_LIMIT:
         return ProbeResult(
             executed=False,
             success=False,
@@ -287,12 +308,21 @@ def probe_git_commit(commit_ref: str, cwd: str) -> ProbeResult | None:
                 command=f"git -C {cwd} log -1 --format='%h %s' {commit_ref}",
                 output=proc.stdout.strip(),
             )
+        stderr = proc.stderr.strip().lower()
+        if proc.returncode != 0 and ("unknown revision" in stderr or "bad object" in stderr or not stderr):
+            return ProbeResult(
+                executed=True,
+                success=False,
+                claim=f"git commit {commit_ref} exists",
+                command=f"git -C {cwd} log -1 --format='%h %s' {commit_ref}",
+                output=f"commit {commit_ref} not found",
+            )
         return ProbeResult(
-            executed=True,
+            executed=False,
             success=False,
             claim=f"git commit {commit_ref} exists",
             command=f"git -C {cwd} log -1 --format='%h %s' {commit_ref}",
-            output=f"commit {commit_ref} not found",
+            output=f"Probe inconclusive: git exit code {proc.returncode} {proc.stderr.strip()}".strip(),
         )
     except Exception as e:
         return ProbeResult(
@@ -393,7 +423,7 @@ def run_active_probes_for_draft(draft: str, cwd: str) -> list[ProbeResult]:
 
     # 6. Probe process PID if explicitly asserted
     pid_matches = re.findall(
-        r"(?i)(?:\brunning\s+as\s+.*?\bPID\s+(\d{1,6})|\brunning(?:\s+\w+)?\s*\(\s*PID\s+(\d{1,6})\s*\)|\bPID\s+(\d{1,6})\s+(?:is\s+)?running|\bprocess\s+(\d{1,6})\s+(?:is\s+)?running)",
+        r"(?i)(?:\brunning\s+as\s+.*?\bPID\s+(\d{1,7})|\brunning(?:\s+\w+)?\s*\(\s*PID\s+(\d{1,7})\s*\)|\bPID\s+(\d{1,7})\s+(?:is\s+)?running|\bprocess\s+(\d{1,7})\s+(?:is\s+)?running)",
         draft,
     )
     seen_pids: set[int] = set()
@@ -401,7 +431,7 @@ def run_active_probes_for_draft(draft: str, cwd: str) -> list[ProbeResult]:
         for pid_str in match_tuple:
             if pid_str and pid_str.isdigit():
                 pid_num = int(pid_str)
-                if 1 <= pid_num <= 99999 and pid_num not in seen_pids:
+                if 1 <= pid_num < PID_LIMIT and pid_num not in seen_pids:
                     seen_pids.add(pid_num)
                     probes.append(probe_process_running(pid_num))
 
