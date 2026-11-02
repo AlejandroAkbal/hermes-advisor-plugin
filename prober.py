@@ -3,8 +3,12 @@
 Provides read-only, non-mutating active probes to verify common system and repo assertions
 without requiring an extra agent turn:
 - Repo clean state (git status --porcelain)
-- File existence / non-empty checks
-- Service / Process presence (launchctl / pgrep)
+- Current git branch (git branch --show-current)
+- Git commit verification (git log -1)
+- File existence / non-empty checks (test -e)
+- Service presence (launchctl list)
+- Process PID presence (ps -p)
+- TCP port listening state (lsof -iTCP -sTCP:LISTEN)
 
 All probes are bounded by strict timeouts (<= 2.0s) and executed in a read-only manner.
 """
@@ -155,9 +159,159 @@ def probe_service_running(label: str) -> ProbeResult | None:
                         command=f"launchctl list | grep {label}",
                         output=f"entry={line.strip()} (alive={is_alive})",
                     )
-    except Exception:
-        pass
+            return ProbeResult(
+                executed=True,
+                success=False,
+                claim=f"service {label} running",
+                command=f"launchctl list | grep {label}",
+                output=f"service {label} not found in launchctl list",
+            )
+    except Exception as e:
+        return ProbeResult(
+            executed=False,
+            success=False,
+            claim=f"service {label} running",
+            command=f"launchctl list | grep {label}",
+            output=f"Probe inconclusive: {e}",
+        )
     return None
+
+
+def probe_port_listening(port: int) -> ProbeResult:
+    """Safely probe if a TCP port is listening on the host."""
+    if not (1 <= port <= 65535):
+        return ProbeResult(
+            executed=False,
+            success=False,
+            claim=f"port {port} listening",
+            command=f"lsof -iTCP:{port} -sTCP:LISTEN -n -P",
+            output=f"Invalid port number: {port}",
+        )
+    try:
+        proc = subprocess.run(
+            ["lsof", f"-iTCP:{port}", "-sTCP:LISTEN", "-n", "-P"],
+            capture_output=True,
+            text=True,
+            timeout=PROBE_TIMEOUT_SECONDS,
+        )
+        if proc.returncode == 0:
+            lines = [
+                line.strip()
+                for line in proc.stdout.splitlines()
+                if "LISTEN" in line or ("TCP" in line and not line.startswith("COMMAND"))
+            ]
+            if lines:
+                return ProbeResult(
+                    executed=True,
+                    success=True,
+                    claim=f"port {port} listening",
+                    command=f"lsof -iTCP:{port} -sTCP:LISTEN -n -P",
+                    output=lines[0],
+                )
+        return ProbeResult(
+            executed=True,
+            success=False,
+            claim=f"port {port} listening",
+            command=f"lsof -iTCP:{port} -sTCP:LISTEN -n -P",
+            output=f"no process listening on port {port}",
+        )
+    except Exception as e:
+        return ProbeResult(
+            executed=False,
+            success=False,
+            claim=f"port {port} listening",
+            command=f"lsof -iTCP:{port} -sTCP:LISTEN -n -P",
+            output=f"Probe inconclusive: {e}",
+        )
+
+
+def probe_process_running(pid: int) -> ProbeResult:
+    """Safely probe if a process with given PID is running on the host."""
+    if pid <= 0 or pid > 999999:
+        return ProbeResult(
+            executed=False,
+            success=False,
+            claim=f"process PID {pid} running",
+            command=f"ps -p {pid} -o pid=,user=,comm=",
+            output=f"Invalid PID: {pid}",
+        )
+    try:
+        proc = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "pid=,user=,comm="],
+            capture_output=True,
+            text=True,
+            timeout=PROBE_TIMEOUT_SECONDS,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            return ProbeResult(
+                executed=True,
+                success=True,
+                claim=f"process PID {pid} running",
+                command=f"ps -p {pid} -o pid=,user=,comm=",
+                output=proc.stdout.strip(),
+            )
+        return ProbeResult(
+            executed=True,
+            success=False,
+            claim=f"process PID {pid} running",
+            command=f"ps -p {pid} -o pid=,user=,comm=",
+            output=f"PID {pid} not found",
+        )
+    except Exception as e:
+        return ProbeResult(
+            executed=False,
+            success=False,
+            claim=f"process PID {pid} running",
+            command=f"ps -p {pid} -o pid=,user=,comm=",
+            output=f"Probe inconclusive: {e}",
+        )
+
+
+def probe_git_commit(commit_ref: str, cwd: str) -> ProbeResult | None:
+    """Safely probe if a git commit hash exists in the repository."""
+    if not os.path.isdir(os.path.join(cwd, ".git")):
+        try:
+            res = subprocess.run(
+                ["git", "-C", cwd, "rev-parse", "--is-inside-work-tree"],
+                capture_output=True,
+                text=True,
+                timeout=PROBE_TIMEOUT_SECONDS,
+            )
+            if res.returncode != 0:
+                return None
+        except Exception:
+            return None
+
+    try:
+        proc = subprocess.run(
+            ["git", "--no-optional-locks", "-C", cwd, "log", "-1", "--format=%h %s", commit_ref],
+            capture_output=True,
+            text=True,
+            timeout=PROBE_TIMEOUT_SECONDS,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            return ProbeResult(
+                executed=True,
+                success=True,
+                claim=f"git commit {commit_ref} exists",
+                command=f"git -C {cwd} log -1 --format='%h %s' {commit_ref}",
+                output=proc.stdout.strip(),
+            )
+        return ProbeResult(
+            executed=True,
+            success=False,
+            claim=f"git commit {commit_ref} exists",
+            command=f"git -C {cwd} log -1 --format='%h %s' {commit_ref}",
+            output=f"commit {commit_ref} not found",
+        )
+    except Exception as e:
+        return ProbeResult(
+            executed=False,
+            success=False,
+            claim=f"git commit {commit_ref} exists",
+            command=f"git -C {cwd} log -1 --format='%h %s' {commit_ref}",
+            output=f"Probe inconclusive: {e}",
+        )
 
 
 def run_active_probes_for_draft(draft: str, cwd: str) -> list[ProbeResult]:
@@ -171,8 +325,29 @@ def run_active_probes_for_draft(draft: str, cwd: str) -> list[ProbeResult]:
             probes.append(res)
 
     # 2. Probe service running if asserted
+    service_labels: set[str] = set()
     if re.search(r"(?i)\b(ai\.hermes\.gateway|gateway is running|gateway restarted)\b", draft):
-        res = probe_service_running("ai.hermes.gateway")
+        service_labels.add("ai.hermes.gateway")
+
+    # Match domain-style launchd service/daemon labels (e.g. com.alejandro.hermes-chrome, ai.hermes.gateway)
+    found_labels = re.findall(
+        r"(?i)\b(?:service|daemon|LaunchAgent|LaunchDaemon)\s+[`'\"]?([a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_.-]+)+)[`'\"]?",
+        draft,
+    )
+    found_labels += re.findall(
+        r"(?i)\b([a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_.-]+)+)\s+(?:service|daemon)?\s+(?:is\s+)?(?:running|alive|active|restarted)\b",
+        draft,
+    )
+    ignored_label_extensions = {
+        "com", "org", "net", "io", "dev", "app", "js", "py", "json", "yml", "yaml", "md", "txt", "html", "sh", "ts"
+    }
+    for lbl in found_labels:
+        parts = lbl.lower().split(".")
+        if parts[-1] not in ignored_label_extensions:
+            service_labels.add(lbl)
+
+    for lbl in service_labels:
+        res = probe_service_running(lbl)
         if res:
             probes.append(res)
 
@@ -210,5 +385,47 @@ def run_active_probes_for_draft(draft: str, cwd: str) -> list[ProbeResult]:
         if not os.path.isabs(expanded_path):
             expanded_path = os.path.abspath(os.path.join(cwd, expanded_path))
         probes.append(probe_file_existence(expanded_path))
+
+    # 5. Probe TCP port listening if explicitly asserted
+    port_matches = re.findall(
+        r"(?i)\b(?:listening\s+(?:on|at)\s+(?:port\s+)?(?:(?:127\.0\.0\.1|0\.0\.0\.0|localhost):)?(\d{2,5})|bound\s+to\s+(?:port\s+)?(?:(?:127\.0\.0\.1|0\.0\.0\.0|localhost):)?(\d{2,5})|port\s+(\d{2,5})\s+(?:is\s+)?(?:listening|open))\b",
+        draft,
+    )
+    seen_ports: set[int] = set()
+    for match_tuple in port_matches:
+        for p_str in match_tuple:
+            if p_str and p_str.isdigit():
+                port_num = int(p_str)
+                if 1 <= port_num <= 65535 and port_num not in seen_ports:
+                    seen_ports.add(port_num)
+                    probes.append(probe_port_listening(port_num))
+
+    # 6. Probe process PID if explicitly asserted
+    pid_matches = re.findall(
+        r"(?i)(?:\brunning\s+as\s+.*?\bPID\s+(\d{1,6})|\brunning(?:\s+\w+)?\s*\(\s*PID\s+(\d{1,6})\s*\)|\bPID\s+(\d{1,6})\s+(?:is\s+)?running|\bprocess\s+(\d{1,6})\s+(?:is\s+)?running)",
+        draft,
+    )
+    seen_pids: set[int] = set()
+    for match_tuple in pid_matches:
+        for pid_str in match_tuple:
+            if pid_str and pid_str.isdigit():
+                pid_num = int(pid_str)
+                if 1 <= pid_num <= 999999 and pid_num not in seen_pids:
+                    seen_pids.add(pid_num)
+                    probes.append(probe_process_running(pid_num))
+
+    # 7. Probe git commit SHA if explicitly asserted
+    commit_matches = re.findall(
+        r"(?i)\b(?:committed\s+(?:in|as|with\s+(?:hash|sha|commit)?)\s+|commit\s+|commit\s+hash\s+|on\s+commit\s+)([0-9a-f]{7,40})\b",
+        draft,
+    )
+    seen_commits: set[str] = set()
+    for sha in commit_matches:
+        sha_lower = sha.lower()
+        if sha_lower not in seen_commits:
+            seen_commits.add(sha_lower)
+            res = probe_git_commit(sha_lower, cwd)
+            if res:
+                probes.append(res)
 
     return probes

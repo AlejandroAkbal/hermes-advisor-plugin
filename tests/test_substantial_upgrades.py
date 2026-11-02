@@ -11,6 +11,9 @@ try:
         probe_file_existence,
         probe_git_branch,
         probe_git_clean_status,
+        probe_git_commit,
+        probe_port_listening,
+        probe_process_running,
         probe_service_running,
         run_active_probes_for_draft,
     )
@@ -21,6 +24,9 @@ except ImportError:
         probe_file_existence,
         probe_git_branch,
         probe_git_clean_status,
+        probe_git_commit,
+        probe_port_listening,
+        probe_process_running,
         probe_service_running,
         run_active_probes_for_draft,
     )
@@ -549,6 +555,102 @@ class TestActiveProber(unittest.TestCase):
             self.assertFalse(any("config.json" in p.claim for p in probes_neg))
             self.assertFalse(any("3.5" in p.claim for p in probes_neg))
             self.assertFalse(any("Node.js" in p.claim for p in probes_neg))
+
+    def test_probe_port_listening(self):
+        # Invalid port
+        res_invalid = probe_port_listening(999999)
+        self.assertFalse(res_invalid.executed)
+        self.assertFalse(res_invalid.success)
+
+        # Unbound high port
+        res_unbound = probe_port_listening(59999)
+        self.assertTrue(res_unbound.executed)
+        self.assertFalse(res_unbound.success)
+        self.assertIn("no process listening", res_unbound.output)
+
+    def test_probe_process_running(self):
+        # Invalid PID
+        res_invalid = probe_process_running(-1)
+        self.assertFalse(res_invalid.executed)
+        self.assertFalse(res_invalid.success)
+
+        # Current running process PID
+        current_pid = os.getpid()
+        res_current = probe_process_running(current_pid)
+        self.assertTrue(res_current.executed)
+        self.assertTrue(res_current.success)
+        self.assertIn(str(current_pid), res_current.output)
+
+        # Non-existent PID
+        res_dead = probe_process_running(999998)
+        self.assertTrue(res_dead.executed)
+        self.assertFalse(res_dead.success)
+
+    def test_probe_git_commit(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subprocess.run(["git", "init"], cwd=tmp_dir, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Tester"], cwd=tmp_dir, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_dir, check=True, capture_output=True)
+            test_file = os.path.join(tmp_dir, "f.txt")
+            with open(test_file, "w") as f:
+                f.write("content")
+            subprocess.run(["git", "add", "."], cwd=tmp_dir, check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "initial test commit"], cwd=tmp_dir, check=True, capture_output=True)
+
+            log_proc = subprocess.run(["git", "rev-parse", "HEAD"], cwd=tmp_dir, check=True, capture_output=True, text=True)
+            head_sha = log_proc.stdout.strip()
+
+            # Existing commit
+            res = probe_git_commit(head_sha[:7], tmp_dir)
+            self.assertIsNotNone(res)
+            self.assertTrue(res.executed)
+            self.assertTrue(res.success)
+            self.assertIn("initial test commit", res.output)
+
+            # Non-existent commit
+            res_bad = probe_git_commit("0123456789abcdef", tmp_dir)
+            self.assertIsNotNone(res_bad)
+            self.assertTrue(res_bad.executed)
+            self.assertFalse(res_bad.success)
+
+    def test_probe_service_running_not_found(self):
+        res = probe_service_running("com.nonexistent.service.xyz.12345")
+        if res is not None and res.executed:
+            self.assertFalse(res.success)
+            self.assertIn("not found in launchctl list", res.output)
+
+    def test_run_active_probes_for_port_pid_and_commit(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subprocess.run(["git", "init"], cwd=tmp_dir, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Tester"], cwd=tmp_dir, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_dir, check=True, capture_output=True)
+            with open(os.path.join(tmp_dir, "f.txt"), "w") as f:
+                f.write("content")
+            subprocess.run(["git", "add", "."], cwd=tmp_dir, check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "probe integration"], cwd=tmp_dir, check=True, capture_output=True)
+
+            log_proc = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=tmp_dir, check=True, capture_output=True, text=True)
+            short_sha = log_proc.stdout.strip()
+
+            cur_pid = os.getpid()
+            draft = (
+                f"The updater is running (PID {cur_pid}), bound to port 59999, "
+                f"committed in {short_sha}, and service com.logi.optionsplus.updater is running."
+            )
+            probes = run_active_probes_for_draft(draft, tmp_dir)
+
+            claims = [p.claim for p in probes]
+            self.assertTrue(any(f"PID {cur_pid}" in c for c in claims))
+            self.assertTrue(any("port 59999" in c for c in claims))
+            self.assertTrue(any(f"commit {short_sha}" in c for c in claims))
+            self.assertTrue(any("com.logi.optionsplus.updater" in c for c in claims))
+
+            # The current PID and commit should be successful
+            pid_probe = next(p for p in probes if f"PID {cur_pid}" in p.claim)
+            self.assertTrue(pid_probe.success)
+
+            commit_probe = next(p for p in probes if f"commit {short_sha}" in p.claim)
+            self.assertTrue(commit_probe.success)
 
 
 class TestDialecticAuditor(unittest.TestCase):
