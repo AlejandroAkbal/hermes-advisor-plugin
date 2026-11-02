@@ -575,11 +575,11 @@ class TestActiveProber(unittest.TestCase):
             self.assertTrue(res_listen.executed)
             self.assertTrue(res_listen.success)
 
-        # Once socket is closed, port is unbound
+        # Once socket is closed, port is unbound (falls back to connection check which is inconclusive on refused connect)
         res_unbound = probe_port_listening(port)
-        if res_unbound.executed:
-            self.assertFalse(res_unbound.success)
-            self.assertIn("no process listening", res_unbound.output)
+        self.assertFalse(res_unbound.success)
+        self.assertFalse(res_unbound.executed)
+        self.assertIn("inconclusive", res_unbound.output.lower())
 
     @unittest.skipUnless(shutil.which("ps"), "ps not available")
     def test_probe_process_running(self):

@@ -207,11 +207,11 @@ def probe_port_listening(port: int) -> ProbeResult:
                     )
             except ConnectionRefusedError:
                 return ProbeResult(
-                    executed=True,
+                    executed=False,
                     success=False,
                     claim=f"port {port} listening",
                     command=f"lsof -iTCP:{port} -sTCP:LISTEN -n -P",
-                    output=f"no process listening on port {port}",
+                    output=f"Probe inconclusive: no visible listener and 127.0.0.1:{port} refused connection",
                 )
             except OSError as e:
                 return ProbeResult(
@@ -351,11 +351,11 @@ def run_active_probes_for_draft(draft: str, cwd: str) -> list[ProbeResult]:
 
     # Match domain-style launchd service/daemon labels (e.g. com.alejandro.hermes-chrome, ai.hermes.gateway)
     found_labels = re.findall(
-        r"(?i)\b(?:service|daemon|LaunchAgent|LaunchDaemon)\s+[`'\"]?([a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_.-]+)+)[`'\"]?",
+        r"(?i)\b(?:service|daemon|LaunchAgent|LaunchDaemon)\s+[`'\"]?([a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]+)+)[`'\"]?",
         draft,
     )
     found_labels += re.findall(
-        r"(?i)\b([a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_.-]+)+)(?:\s+(?:service|daemon))?\s+(?:is\s+)?(?:running|alive|active|restarted)\b",
+        r"(?i)\b([a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]+)+\.?)(?:\s+(?:service|daemon))?\s+(?:is\s+)?(?:running|alive|active|restarted)\b",
         draft,
     )
     ignored_label_extensions = {
