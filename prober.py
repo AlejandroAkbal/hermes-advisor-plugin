@@ -178,28 +178,34 @@ def run_active_probes_for_draft(draft: str, cwd: str) -> list[ProbeResult]:
 
     # 3. Probe git branch if claimed with explicit branch wording
     branch_m = re.search(
-        r"(?i)\b(?:switched to branch|checked out branch|on feature branch|on feature|on branch)\s+(?:branch\s+)?([a-zA-Z0-9_\-\.\/]+)\b",
+        r"(?i)\b(?:switched to branch|checked out branch|on feature branch|on branch)\s+(?:branch\s+)?([a-zA-Z0-9_\-\.\/]+)\b",
         draft,
     )
     if branch_m:
         claimed_branch = branch_m.group(1).strip()
-        if claimed_branch.lower() not in {"the", "a", "an", "our", "this", "that", "clean", "dirty"}:
-            res = probe_git_branch(cwd)
-            if res and res.executed:
-                res.success = (res.output == claimed_branch)
-                res.claim = f"on branch {claimed_branch}"
-                probes.append(res)
+        stop_words = {"the", "a", "an", "our", "this", "that", "clean", "dirty", "and", "or", "to", "is", "for", "with", "all", "tests", "parity", "flags"}
+        if claimed_branch.lower() not in stop_words:
+            if re.search(r"[/\-_0-9]", claimed_branch) or claimed_branch.lower() in {"main", "master", "dev", "develop"}:
+                res = probe_git_branch(cwd)
+                if res and res.executed:
+                    res.success = (res.output == claimed_branch)
+                    res.claim = f"on branch {claimed_branch}"
+                    probes.append(res)
 
-    # 4. Probe file existence if explicit file creation or existence is asserted with a file path
+    # 4. Probe file existence if explicit file creation or existence is asserted with a path-like token
+    ext_pattern = r"(?:py|json|ya?ml|toml|md|txt|ts|js|sh|html|css|rs|go|log|lock|conf|cfg|ini|sql)"
     post_verb_matches = re.findall(
-        r"(?i)(?:created|written|saved|added|exists?)\s+(?:in|to|at)?\s*[`'\"]?([/~a-zA-Z0-9_\-./]+(?:\.[a-zA-Z0-9_\-]+))[`'\"]?",
+        rf"(?i)(?<!not )(?<!never )(?<!n't )\b(?:created|written\s+to|written\s+into|saved|added)\s+(?:in|to|at)?\s*[`'\"]?([/~a-zA-Z0-9_\-./]+(?:\.{ext_pattern}))[`'\"]?",
         draft,
     )
     pre_verb_matches = re.findall(
-        r"(?i)[`'\"]?([/~a-zA-Z0-9_\-./]+(?:\.[a-zA-Z0-9_\-]+))[`'\"]?\s+exists?\b",
+        rf"(?i)(?<!not )(?<!never )(?<!n't )[`'\"]?([/~a-zA-Z0-9_\-./]+(?:\.{ext_pattern}))[`'\"]?\s+exists?\b",
         draft,
     )
-    for p in set(post_verb_matches + pre_verb_matches):
+    ignored_basenames = {"node.js", "react.js", "vue.js", "next.js", "deno.js"}
+    for p in dict.fromkeys(post_verb_matches + pre_verb_matches):
+        if os.path.basename(p).lower() in ignored_basenames:
+            continue
         expanded_path = os.path.expanduser(p)
         if not os.path.isabs(expanded_path):
             expanded_path = os.path.abspath(os.path.join(cwd, expanded_path))

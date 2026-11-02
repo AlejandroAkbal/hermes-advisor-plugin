@@ -84,12 +84,12 @@ _CORROBORATION_RULES = [
             r"(?<!ready to be )(?<!going to be )(?<!yet to be )"
             r"\b(?:"
             r"(?:committed\s+(?:the\s+|all\s+)?(?:changes?|diffs?|files?|updates?|fixes?|code)\b)"
-            r"|(?:committed\s+to\s+(?:the\s+)?(?:branch\s+)?[a-zA-Z0-9_\-\.\/]+)"
+            r"|(?:committed\s+(?:\w+\s+)?to\s+(?:the\s+)?branch\s+[a-zA-Z0-9_\-\.\/]+)"
             r"|(?:created\s+(?:a\s+|the\s+)?commit\b)"
             r"|(?:changes?\s+(?:have\s+been\s+|were\s+)?committed\b)"
             r")\b"
         ),
-        "required_tool_patterns": [r"\bgit\s+commit\b", r"\bgit\s+-C\s+.*?\s+commit\b"],
+        "required_tool_patterns": [r"\bgit\s+(?:-c\s+\S+\s+)*commit\b", r"\bgit\s+-C\s+.*?\s+commit\b"],
         "suggested_command": "Run `git commit` before claiming changes were committed.",
     },
     {
@@ -137,7 +137,7 @@ def _extract_created_pr_number(args_str: str, res_str: str) -> str | None:
     url_m = re.search(r"https?://github\.com/[^/\s]+/[^/\s]+/pull/(\d+)", res_str)
     if url_m:
         return url_m.group(1)
-    num_m = re.search(r"\b#(\d+)\b", res_str)
+    num_m = re.search(r"(?<!\w)#(\d+)\b", res_str)
     if num_m:
         return num_m.group(1)
     return None
@@ -217,11 +217,13 @@ def audit_draft_ledger(
     )
     valid_evidence_lines = []
     if evidence:
+        skip_block = False
         for line in evidence.splitlines():
-            # A contradicted probe cannot serve as corroborating evidence
-            if "[Active Probe CONTRADICTED]" in line:
-                continue
-            valid_evidence_lines.append(line)
+            if line.startswith("[Active Probe"):
+                # Only keep confirmed probes as evidence; drop CONTRADICTED or INCONCLUSIVE blocks
+                skip_block = not line.startswith("[Active Probe CONFIRMED]")
+            if not skip_block:
+                valid_evidence_lines.append(line)
     filtered_evidence = "\n".join(valid_evidence_lines)
     combined_evidence = f"{combined_tool_text} {filtered_evidence}".lower()
 
@@ -340,6 +342,7 @@ def audit_draft_ledger(
                     or re.search(r"\bFAILED\b", res_str)
                     or re.search(r"(?i)\b(?:failures|errors)\s*=\s*[1-9]\d*\b", res_str)
                     or re.search(r"(?i)\b[1-9]\d*\s+failed\b", res_str)
+                    or re.search(r"(?i)\b[1-9]\d*\s+errors?\b", res_str)
                 )
                 if has_positive_failure:
                     missing_checks.append("Fix failing tests before claiming the test suite passed.")

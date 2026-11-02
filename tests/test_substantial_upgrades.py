@@ -329,12 +329,23 @@ class TestDeterministicLedger(unittest.TestCase):
         )
         self.assertTrue(v_ok_zero.passed)
 
-        # Pytest-style positive failures count
-        v_fail_pytest = audit_draft_ledger(
+        # Pytest collection/setup errors
+        v_fail_pytest_err = audit_draft_ledger(
             "All tests pass.",
-            tool_events=[{"tool": "terminal", "args": "pytest", "result": "1 failed, 15 passed in 0.5s"}]
+            tool_events=[{"tool": "terminal", "args": "pytest", "result": "1 error in 0.3s"}]
         )
-        self.assertFalse(v_fail_pytest.passed)
+        self.assertFalse(v_fail_pytest_err.passed)
+
+        # Non-git prose like 'committed to quality' should not trigger git_committed rule
+        v_prose = audit_draft_ledger("We are committed to quality and fixing the issue.", tool_events=[])
+        self.assertTrue(v_prose.passed)
+
+        # git -c user.name=... commit should corroborate git_committed
+        v_git_c = audit_draft_ledger(
+            "Committed the fix to the branch.",
+            tool_events=[{"tool": "terminal", "args": "git -c user.name='Bot' commit -m 'fix'", "result": "[feat 123] fix"}]
+        )
+        self.assertTrue(v_git_c.passed)
 
         # Mismatched PR merge across multiple events (one failed for 19, one succeeded for 20)
         v_multi_merge = audit_draft_ledger(
@@ -390,6 +401,14 @@ class TestDeterministicLedger(unittest.TestCase):
             evidence="[Active Probe CONTRADICTED]: `git -C /repo status --porcelain` -> M file.py"
         )
         self.assertFalse(v_contra.passed)
+
+        # Inconclusive probe evidence must not satisfy corroboration
+        v_incon = audit_draft_ledger(
+            "The working tree is clean.",
+            tool_events=[],
+            evidence="[Active Probe INCONCLUSIVE]: `git -C /repo status --porcelain` -> Probe inconclusive: timeout"
+        )
+        self.assertFalse(v_incon.passed)
 
 
 class TestActiveProber(unittest.TestCase):
@@ -463,10 +482,17 @@ class TestActiveProber(unittest.TestCase):
             probes_pre = run_active_probes_for_draft(draft_pre, tmp_dir)
             self.assertTrue(any("config.json" in p.claim and p.success for p in probes_pre))
 
-            # Test non-branch phrasing 'on Linux' does not trigger false branch probe
-            draft_os = "All tests pass on Linux."
+            # Test non-branch phrasing 'on Linux' and 'on feature parity' do not trigger false branch probe
+            draft_os = "All tests pass on Linux, working on feature parity."
             probes_os = run_active_probes_for_draft(draft_os, tmp_dir)
             self.assertFalse(any("branch" in p.claim for p in probes_os))
+
+            # Test negated file creation and non-path words like 'Node.js' or '3.5' do not trigger file probe
+            draft_neg = "I have not created config.json yet. Saved 3.5 seconds, written in Node.js."
+            probes_neg = run_active_probes_for_draft(draft_neg, tmp_dir)
+            self.assertFalse(any("config.json" in p.claim for p in probes_neg))
+            self.assertFalse(any("3.5" in p.claim for p in probes_neg))
+            self.assertFalse(any("Node.js" in p.claim for p in probes_neg))
 
 
 class TestDialecticAuditor(unittest.TestCase):
