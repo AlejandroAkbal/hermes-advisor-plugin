@@ -72,7 +72,7 @@ _CORROBORATION_RULES = [
             r"|(?:automatically\s+)?merged\s+the\s+pr\b"
             r")\b"
         ),
-        "required_tool_patterns": [r"\bgh\s+pr\s+merge\b", r"\bgit\s+merge\b", r"\bgit\s+-C\s+.*?\s+merge\b"],
+        "required_tool_patterns": [r"\bgh\s+pr\s+merge\b"],
         "suggested_command": "Verify PR merge via `gh pr merge` or `gh pr view`.",
     },
     {
@@ -190,7 +190,15 @@ def audit_draft_ledger(
     combined_tool_text = " ".join(
         f"{ev.get('tool', '')} {ev.get('args', '')}" for ev in tool_events
     )
-    combined_evidence = f"{combined_tool_text} {evidence or ''}".lower()
+    valid_evidence_lines = []
+    if evidence:
+        for line in evidence.splitlines():
+            # A contradicted probe cannot serve as corroborating evidence
+            if "[Active Probe CONTRADICTED]" in line:
+                continue
+            valid_evidence_lines.append(line)
+    filtered_evidence = "\n".join(valid_evidence_lines)
+    combined_evidence = f"{combined_tool_text} {filtered_evidence}".lower()
 
     # 2. Check corroboration rules
     missing_checks = []
@@ -228,35 +236,40 @@ def audit_draft_ledger(
                     unbacked_reasons.append("CodeRabbit review command reported an error or failure.")
 
             elif rule["name"] == "pr_created" and matching_events:
-                latest_create = matching_events[-1]
-                res_str = str(latest_create.get("result", ""))
-                if _result_indicates_failure(res_str):
-                    missing_checks.append("Verify `gh pr create` succeeded before claiming a PR was created.")
-                    unbacked_reasons.append("Tool `gh pr create` failed to create a PR.")
-                else:
-                    # If specific PR number is cited in the matched claim, verify it matches creation events
-                    pr_num_m = re.search(r"(?i)\b(?:pr|pull request)\s+#?(\d+)\b", rule_match.group(0))
-                    if pr_num_m:
-                        claimed_num = pr_num_m.group(1)
-                        create_text = " ".join(f"{ev.get('args', '')} {ev.get('result', '')}" for ev in matching_events)
-                        if not re.search(rf"(?<!\d){re.escape(claimed_num)}(?!\d)", create_text):
-                            missing_checks.append(f"Verify PR #{claimed_num} identity via `gh pr view {claimed_num}`.")
-                            unbacked_reasons.append(f"Draft cites PR #{claimed_num}, but tool outputs do not corroborate PR #{claimed_num}.")
+                pr_num_m = re.search(r"(?i)\b(?:pr|pull request)\s+#?(\d+)\b", rule_match.group(0))
+                claimed_num = pr_num_m.group(1) if pr_num_m else None
+                successful_matches = []
+                for ev in matching_events:
+                    res_str = str(ev.get("result", ""))
+                    args_str = str(ev.get("args", ""))
+                    if not _result_indicates_failure(res_str):
+                        if claimed_num is None or re.search(rf"(?<!\d){re.escape(claimed_num)}(?!\d)", f"{args_str} {res_str}"):
+                            successful_matches.append(ev)
+                if not successful_matches:
+                    if claimed_num:
+                        missing_checks.append(f"Verify PR #{claimed_num} identity via `gh pr view {claimed_num}`.")
+                        unbacked_reasons.append(f"No successful `gh pr create` event corroborates PR #{claimed_num}.")
+                    else:
+                        missing_checks.append("Verify `gh pr create` succeeded before claiming a PR was created.")
+                        unbacked_reasons.append("Tool `gh pr create` failed to create a PR.")
 
             elif rule["name"] == "pr_merged" and matching_events:
-                latest_merge = matching_events[-1]
-                res_str = str(latest_merge.get("result", ""))
-                if _result_indicates_failure(res_str):
-                    missing_checks.append("Verify `gh pr merge` succeeded before claiming a PR was merged.")
-                    unbacked_reasons.append("Tool `gh pr merge` or `git merge` failed to merge.")
-                else:
-                    pr_num_m = re.search(r"(?i)\b(?:pr|pull request)\s+#?(\d+)\b", rule_match.group(0))
-                    if pr_num_m:
-                        claimed_num = pr_num_m.group(1)
-                        merge_text = " ".join(f"{ev.get('args', '')} {ev.get('result', '')}" for ev in matching_events)
-                        if not re.search(rf"(?<!\d){re.escape(claimed_num)}(?!\d)", merge_text):
-                            missing_checks.append(f"Verify PR #{claimed_num} merge via `gh pr view {claimed_num}`.")
-                            unbacked_reasons.append(f"Draft cites merged PR #{claimed_num}, but tool outputs do not corroborate PR #{claimed_num}.")
+                pr_num_m = re.search(r"(?i)\b(?:pr|pull request)\s+#?(\d+)\b", rule_match.group(0))
+                claimed_num = pr_num_m.group(1) if pr_num_m else None
+                successful_merges = []
+                for ev in matching_events:
+                    res_str = str(ev.get("result", ""))
+                    args_str = str(ev.get("args", ""))
+                    if not _result_indicates_failure(res_str):
+                        if claimed_num is None or re.search(rf"(?<!\d){re.escape(claimed_num)}(?!\d)", f"{args_str} {res_str}"):
+                            successful_merges.append(ev)
+                if not successful_merges:
+                    if claimed_num:
+                        missing_checks.append(f"Verify PR #{claimed_num} merge via `gh pr view {claimed_num}`.")
+                        unbacked_reasons.append(f"No successful `gh pr merge` event corroborates merging PR #{claimed_num}.")
+                    else:
+                        missing_checks.append("Verify `gh pr merge` succeeded before claiming a PR was merged.")
+                        unbacked_reasons.append("Tool `gh pr merge` failed to merge.")
 
             elif rule["name"] == "git_committed" and matching_events:
                 latest_commit = matching_events[-1]
@@ -275,7 +288,13 @@ def audit_draft_ledger(
             elif rule["name"] == "test_suite_passed" and matching_events:
                 latest_test = matching_events[-1]
                 res_str = str(latest_test.get("result", ""))
-                if _result_indicates_failure(res_str) or re.search(r"(?i)\b(FAILED|failures=\d+|errors=\d+)\b", res_str):
+                has_positive_failure = bool(
+                    _result_indicates_failure(res_str)
+                    or re.search(r"\bFAILED\b", res_str)
+                    or re.search(r"(?i)\b(?:failures|errors)\s*=\s*[1-9]\d*\b", res_str)
+                    or re.search(r"(?i)\b[1-9]\d*\s+failed\b", res_str)
+                )
+                if has_positive_failure:
                     missing_checks.append("Fix failing tests before claiming the test suite passed.")
                     unbacked_reasons.append("Test runner reported failures or errors.")
 

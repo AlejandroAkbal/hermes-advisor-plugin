@@ -322,12 +322,29 @@ class TestDeterministicLedger(unittest.TestCase):
         )
         self.assertFalse(v_fail.passed)
 
-        # Successful test suite
-        v_ok = audit_draft_ledger(
+        # Successful test suite with 0 failures explicitly in string
+        v_ok_zero = audit_draft_ledger(
             "All tests pass.",
-            tool_events=[{"tool": "terminal", "args": "python -m unittest", "result": "Ran 50 tests in 0.2s. OK"}]
+            tool_events=[{"tool": "terminal", "args": "python -m unittest", "result": "failures=0, errors=0. OK"}]
         )
-        self.assertTrue(v_ok.passed)
+        self.assertTrue(v_ok_zero.passed)
+
+        # Pytest-style positive failures count
+        v_fail_pytest = audit_draft_ledger(
+            "All tests pass.",
+            tool_events=[{"tool": "terminal", "args": "pytest", "result": "1 failed, 15 passed in 0.5s"}]
+        )
+        self.assertFalse(v_fail_pytest.passed)
+
+        # Mismatched PR merge across multiple events (one failed for 19, one succeeded for 20)
+        v_multi_merge = audit_draft_ledger(
+            "Merged PR #19 successfully.",
+            tool_events=[
+                {"tool": "terminal", "args": "gh pr merge 19", "result": "exit_code: 1\nerror: merge conflict"},
+                {"tool": "terminal", "args": "gh pr merge 20", "result": "Merged PR #20"},
+            ]
+        )
+        self.assertFalse(v_multi_merge.passed)
 
     def test_evidence_parameter_is_checked_in_corroboration(self):
         # Corroborating evidence supplied in evidence parameter (e.g. from active probes)
@@ -337,6 +354,14 @@ class TestDeterministicLedger(unittest.TestCase):
             evidence="[Active Probe CONFIRMED]: `git -C /repo status --porcelain` -> working tree clean"
         )
         self.assertTrue(v.passed)
+
+        # Contradicted probe evidence must not satisfy corroboration
+        v_contra = audit_draft_ledger(
+            "The working tree is clean.",
+            tool_events=[],
+            evidence="[Active Probe CONTRADICTED]: `git -C /repo status --porcelain` -> M file.py"
+        )
+        self.assertFalse(v_contra.passed)
 
 
 class TestActiveProber(unittest.TestCase):

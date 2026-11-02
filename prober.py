@@ -180,7 +180,7 @@ def run_active_probes_for_draft(draft: str, cwd: str) -> list[ProbeResult]:
     branch_m = re.search(r"(?i)\b(?:on|switched to|checked out|on feature|on branch)\s+(?:branch\s+)?([a-zA-Z0-9_\-\.\/]+)\b", draft)
     if branch_m:
         claimed_branch = branch_m.group(1).strip()
-        if claimed_branch.lower() not in {"the", "a", "an", "our", "this", "that", "clean", "dirty", "main", "master"}:
+        if claimed_branch.lower() not in {"the", "a", "an", "our", "this", "that", "clean", "dirty"}:
             res = probe_git_branch(cwd)
             if res and res.executed:
                 res.success = (res.output == claimed_branch)
@@ -189,12 +189,13 @@ def run_active_probes_for_draft(draft: str, cwd: str) -> list[ProbeResult]:
 
     # 4. Probe file existence if explicit file creation or existence is asserted with a file path
     file_matches = re.findall(
-        r"(?i)(?:created|written|saved|added|exists?)\s+(?:in|to|at)?\s*[`'\"]?([/~][a-zA-Z0-9_\-./]+(?:\.[a-zA-Z0-9_\-]+))[`'\"]?",
+        r"(?i)(?:created|written|saved|added|exists?)\s+(?:in|to|at)?\s*[`'\"]?([/~a-zA-Z0-9_\-./]+(?:\.[a-zA-Z0-9_\-]+))[`'\"]?",
         draft,
     )
     for p in file_matches:
         expanded_path = os.path.expanduser(p)
-        if os.path.isabs(expanded_path):
-            probes.append(probe_file_existence(expanded_path))
+        if not os.path.isabs(expanded_path):
+            expanded_path = os.path.abspath(os.path.join(cwd, expanded_path))
+        probes.append(probe_file_existence(expanded_path))
 
     return probes
