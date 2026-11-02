@@ -9,6 +9,7 @@ try:
     from hermes_plugins.advisor.ledger import audit_draft_ledger
     from hermes_plugins.advisor.prober import (
         probe_file_existence,
+        probe_git_branch,
         probe_git_clean_status,
         probe_service_running,
         run_active_probes_for_draft,
@@ -18,6 +19,7 @@ except ImportError:
     from advisor.ledger import audit_draft_ledger
     from advisor.prober import (
         probe_file_existence,
+        probe_git_branch,
         probe_git_clean_status,
         probe_service_running,
         run_active_probes_for_draft,
@@ -244,6 +246,170 @@ class TestDeterministicLedger(unittest.TestCase):
         self.assertFalse(v_claims.passed)
         self.assertEqual(v_claims.rule, "unbacked_assertion")
 
+    def test_corroboration_rule_catches_unrun_or_failed_git_committed(self):
+        # Unrun commit claim
+        v = audit_draft_ledger("Committed changes to the feature branch.", tool_events=[])
+        self.assertFalse(v.passed)
+        self.assertEqual(v.rule, "unbacked_assertion")
+        self.assertIn("git commit", v.missing_checks[0])
+
+        # Negated commit claim should pass
+        v_neg = audit_draft_ledger("I have not committed the changes yet.", tool_events=[])
+        self.assertTrue(v_neg.passed)
+
+        # Failed commit (nothing to commit)
+        v_fail = audit_draft_ledger(
+            "Committed changes to the feature branch.",
+            tool_events=[{"tool": "terminal", "args": "git commit -m 'fix'", "result": "On branch feat\nnothing to commit, working tree clean"}]
+        )
+        self.assertFalse(v_fail.passed)
+
+        # Successful commit
+        v_ok = audit_draft_ledger(
+            "Committed changes to the feature branch.",
+            tool_events=[{"tool": "terminal", "args": "git commit -m 'fix'", "result": "[feat 1234abc] fix: resolve bug\n 1 file changed"}]
+        )
+        self.assertTrue(v_ok.passed)
+
+    def test_corroboration_rule_catches_failed_git_pushed(self):
+        # Failed push
+        v_fail = audit_draft_ledger(
+            "Changes pushed to origin successfully.",
+            tool_events=[{"tool": "terminal", "args": "git push origin feat", "result": "error: failed to push some refs to 'origin'\nexit_code: 1"}]
+        )
+        self.assertFalse(v_fail.passed)
+
+        # Successful push
+        v_ok = audit_draft_ledger(
+            "Changes pushed to origin successfully.",
+            tool_events=[{"tool": "terminal", "args": "git push origin feat", "result": "To github.com:user/repo.git\n * [new branch] feat -> feat"}]
+        )
+        self.assertTrue(v_ok.passed)
+
+    def test_corroboration_rule_catches_unrun_or_failed_pr_merged(self):
+        # Unrun PR merge
+        v = audit_draft_ledger("Merged PR #19 successfully.", tool_events=[])
+        self.assertFalse(v.passed)
+        self.assertEqual(v.rule, "unbacked_assertion")
+        self.assertIn("gh pr merge", v.missing_checks[0])
+
+        # Failed PR merge
+        v_fail = audit_draft_ledger(
+            "Merged PR #19 successfully.",
+            tool_events=[{"tool": "terminal", "args": "gh pr merge 19 --admin", "result": "GraphQL error: pull request merge failed\nexit_code: 1"}]
+        )
+        self.assertFalse(v_fail.passed)
+
+        # Mismatched PR number in merge
+        v_mismatch = audit_draft_ledger(
+            "Merged PR #99 successfully.",
+            tool_events=[{"tool": "terminal", "args": "gh pr merge 19 --admin", "result": "Merged PR #19"}]
+        )
+        self.assertFalse(v_mismatch.passed)
+
+        # Successful PR merge
+        v_ok = audit_draft_ledger(
+            "Merged PR #19 successfully.",
+            tool_events=[{"tool": "terminal", "args": "gh pr merge 19 --admin", "result": "Merged PR #19 (AlejandroAkbal/hermes-advisor-plugin)"}]
+        )
+        self.assertTrue(v_ok.passed)
+
+    def test_corroboration_rule_catches_failed_test_suite(self):
+        # Failed test suite with 'all tests pass' claim
+        v_fail = audit_draft_ledger(
+            "All tests pass.",
+            tool_events=[{"tool": "terminal", "args": "python -m unittest", "result": "FAILED (failures=1, errors=0)\nexit_code: 1"}]
+        )
+        self.assertFalse(v_fail.passed)
+
+        # Successful test suite with 0 failures explicitly in string
+        v_ok_zero = audit_draft_ledger(
+            "All tests pass.",
+            tool_events=[{"tool": "terminal", "args": "python -m unittest", "result": "failures=0, errors=0. OK"}]
+        )
+        self.assertTrue(v_ok_zero.passed)
+
+        # Pytest collection/setup errors
+        v_fail_pytest_err = audit_draft_ledger(
+            "All tests pass.",
+            tool_events=[{"tool": "terminal", "args": "pytest", "result": "1 error in 0.3s"}]
+        )
+        self.assertFalse(v_fail_pytest_err.passed)
+
+        # Non-git prose like 'committed to quality' should not trigger git_committed rule
+        v_prose = audit_draft_ledger("We are committed to quality and fixing the issue.", tool_events=[])
+        self.assertTrue(v_prose.passed)
+
+        # git -c user.name=... commit should corroborate git_committed
+        v_git_c = audit_draft_ledger(
+            "Committed the fix to the branch.",
+            tool_events=[{"tool": "terminal", "args": "git -c user.name='Bot' commit -m 'fix'", "result": "[feat 123] fix"}]
+        )
+        self.assertTrue(v_git_c.passed)
+
+        # Mismatched PR merge across multiple events (one failed for 19, one succeeded for 20)
+        v_multi_merge = audit_draft_ledger(
+            "Merged PR #19 successfully.",
+            tool_events=[
+                {"tool": "terminal", "args": "gh pr merge 19", "result": "exit_code: 1\nerror: merge conflict"},
+                {"tool": "terminal", "args": "gh pr merge 20", "result": "Merged PR #20"},
+            ]
+        )
+        self.assertFalse(v_multi_merge.passed)
+
+    def test_probe_text_does_not_corroborate_test_suite_execution(self):
+        # Arbitrary probe evidence containing 'pytest' must not corroborate a test run without a tool event
+        v = audit_draft_ledger(
+            "All tests pass.",
+            tool_events=[],
+            evidence="[Active Probe CONFIRMED]: test -e /tmp/pytest.log -> exists=True"
+        )
+        self.assertFalse(v.passed)
+        self.assertEqual(v.rule, "unbacked_assertion")
+
+    def test_multiple_cited_prs_must_all_be_corroborated(self):
+        # Draft cites two merged PRs, but only one was merged
+        v = audit_draft_ledger(
+            "Merged PR #19 and merged PR #20 successfully.",
+            tool_events=[{"tool": "terminal", "args": "gh pr merge 19 --admin", "result": "https://github.com/org/repo/pull/19"}]
+        )
+        self.assertFalse(v.passed)
+        self.assertIn("PR #20", v.reason)
+
+    def test_operation_identity_avoids_spurious_pr_number_matches(self):
+        # PR title cites #99, but actual PR created was #15
+        v = audit_draft_ledger(
+            "Opened PR #99.",
+            tool_events=[{"tool": "terminal", "args": "gh pr create --title 'Follow-up to PR #99'", "result": "https://github.com/org/repo/pull/15"}]
+        )
+        self.assertFalse(v.passed)
+        self.assertIn("PR #99", v.reason)
+
+    def test_evidence_parameter_is_checked_in_corroboration(self):
+        # Corroborating evidence supplied in evidence parameter (e.g. from active probes)
+        v = audit_draft_ledger(
+            "The working tree is clean.",
+            tool_events=[],
+            evidence="[Active Probe CONFIRMED]: `git -C /repo status --porcelain` -> working tree clean"
+        )
+        self.assertTrue(v.passed)
+
+        # Contradicted probe evidence must not satisfy corroboration
+        v_contra = audit_draft_ledger(
+            "The working tree is clean.",
+            tool_events=[],
+            evidence="[Active Probe CONTRADICTED]: `git -C /repo status --porcelain` -> M file.py"
+        )
+        self.assertFalse(v_contra.passed)
+
+        # Inconclusive probe evidence must not satisfy corroboration
+        v_incon = audit_draft_ledger(
+            "The working tree is clean.",
+            tool_events=[],
+            evidence="[Active Probe INCONCLUSIVE]: `git -C /repo status --porcelain` -> Probe inconclusive: timeout"
+        )
+        self.assertFalse(v_incon.passed)
+
 
 class TestActiveProber(unittest.TestCase):
     def test_probe_file_existence(self):
@@ -278,6 +444,55 @@ class TestActiveProber(unittest.TestCase):
             probes_expanded = run_active_probes_for_draft(draft_expanded, tmp_dir)
             self.assertTrue(len(probes_expanded) >= 1)
             self.assertTrue(probes_expanded[0].success)
+
+    def test_probe_git_branch(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subprocess.run(["git", "init", "-b", "my-feature"], cwd=tmp_dir, check=True, capture_output=True)
+            res = probe_git_branch(tmp_dir)
+            self.assertIsNotNone(res)
+            self.assertTrue(res.executed)
+            self.assertTrue(res.success)
+            self.assertEqual(res.output, "my-feature")
+
+    def test_run_active_probes_for_branch_and_file(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subprocess.run(["git", "init", "-b", "feat/my-probe"], cwd=tmp_dir, check=True, capture_output=True)
+            # Create a test file
+            test_file = os.path.join(tmp_dir, "test_artifact.txt")
+            with open(test_file, "w") as f:
+                f.write("hello")
+
+            draft = f"I am on branch feat/my-probe and created {test_file}."
+            probes = run_active_probes_for_draft(draft, tmp_dir)
+            self.assertTrue(len(probes) >= 2)
+            branch_probe = next((p for p in probes if "branch" in p.claim), None)
+            file_probe = next((p for p in probes if "file exists" in p.claim), None)
+            self.assertIsNotNone(branch_probe)
+            self.assertIsNotNone(file_probe)
+            assert branch_probe is not None
+            assert file_probe is not None
+            self.assertTrue(branch_probe.success)
+            self.assertTrue(file_probe.success)
+
+            # Test path before exists: 'artifact.json exists'
+            json_file = os.path.join(tmp_dir, "config.json")
+            with open(json_file, "w") as f:
+                f.write("{}")
+            draft_pre = f"{json_file} exists in the directory."
+            probes_pre = run_active_probes_for_draft(draft_pre, tmp_dir)
+            self.assertTrue(any("config.json" in p.claim and p.success for p in probes_pre))
+
+            # Test non-branch phrasing 'on Linux' and 'on feature parity' do not trigger false branch probe
+            draft_os = "All tests pass on Linux, working on feature parity."
+            probes_os = run_active_probes_for_draft(draft_os, tmp_dir)
+            self.assertFalse(any("branch" in p.claim for p in probes_os))
+
+            # Test negated file creation and non-path words like 'Node.js' or '3.5' do not trigger file probe
+            draft_neg = "I have not created config.json yet. Saved 3.5 seconds, written in Node.js."
+            probes_neg = run_active_probes_for_draft(draft_neg, tmp_dir)
+            self.assertFalse(any("config.json" in p.claim for p in probes_neg))
+            self.assertFalse(any("3.5" in p.claim for p in probes_neg))
+            self.assertFalse(any("Node.js" in p.claim for p in probes_neg))
 
 
 class TestDialecticAuditor(unittest.TestCase):
