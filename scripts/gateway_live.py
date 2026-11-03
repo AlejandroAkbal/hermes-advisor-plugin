@@ -3,8 +3,8 @@
 
 `check` is read-only: it compares the gateway process start time with the newest
 commit that touched the plugin directory. `restart` detaches a helper in its own
-session (so the gateway's SIGTERM cannot kill it), waits for a quiet window,
-kickstarts the launchd job, then re-checks.
+session (so the gateway's SIGTERM cannot kill it), waits for a quiet window, sends
+the gateway's graceful-restart signal, then re-checks.
 
 Exit codes: 0 live, 3 stale, 4 cannot determine, 5 restart failed.
 """
@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -22,10 +23,10 @@ from pathlib import Path
 
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 LOG_PATH = Path.home() / ".hermes" / "advisor" / "gateway_live.log"
-LAUNCHD_LABEL = "ai.hermes.gateway"
 STATUS_PID_RE = re.compile(r"PID (\d+)")
-# launchd clamps ExitTimeOut to 60s per user domain, so a turn still running when
-# SIGTERM lands gets at most that long to finish.
+# How long we allow the gateway to finish its in-flight turn and respawn before
+# declaring the restart failed. The drain itself is not launchd-bounded: in-band
+# SIGUSR1 restarts bypass ExitTimeOut (gateway/run_bootstrap.py:234).
 DRAIN_GRACE_SECONDS = 60
 
 
@@ -108,19 +109,22 @@ def _log(message: str) -> None:
 def _restart_worker(repo: Path, wait_seconds: int) -> int:
     _log(f"restart scheduled in {wait_seconds}s for {repo}")
     time.sleep(wait_seconds)
-    uid = os.getuid()
-    result = subprocess.run(
-        ["launchctl", "kickstart", "-k", f"gui/{uid}/{LAUNCHD_LABEL}"],
-        capture_output=True, text=True,
-    )
-    _log(f"kickstart exit={result.returncode} {result.stderr.strip()[:200]}")
-    deadline = time.time() + DRAIN_GRACE_SECONDS + 120
-    old_pid = gateway_pid()
+    pid = gateway_pid()
+    if pid is None:
+        _log("no gateway pid; nothing to signal")
+        return 4
+    try:
+        os.kill(pid, signal.SIGUSR1)
+    except OSError as exc:
+        _log(f"signal failed: {exc}")
+        return 5
+    _log(f"SIGUSR1 sent to {pid}")
+    deadline = time.time() + DRAIN_GRACE_SECONDS + 180
     while time.time() < deadline:
         time.sleep(5)
         new_pid = gateway_pid()
-        if new_pid and new_pid != old_pid:
-            _log(f"gateway respawned pid {old_pid} -> {new_pid}")
+        if new_pid and new_pid != pid:
+            _log(f"gateway respawned pid {pid} -> {new_pid}")
             return check(repo)
     _log("gateway did not respawn in time")
     return 5
