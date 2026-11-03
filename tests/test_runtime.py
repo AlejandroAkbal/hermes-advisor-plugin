@@ -227,6 +227,88 @@ class TestAdvisorRuntime(unittest.TestCase):
         self.assertEqual(state.parse_response("nothing to flag"), [])
         self.assertEqual(state.parse_response("Nothing to flag."), [])
 
+    def test_rejection_guidance_injected_on_next_llm_call(self):
+        class MockCtx:
+            class MockLLM:
+                def complete(self, **kwargs):
+                    raise AssertionError("no LLM call expected")
+
+            llm = MockLLM()
+
+        rt = runtime_mod.AdvisorRuntime(MockCtx())
+        rt.state.enabled = True
+        rt._record_rejection(
+            "s", {"reason": "The draft claims the deploy succeeded; no deploy tool ran."}, runtime_mod._user_key("do the thing")
+        )
+        res = rt.on_pre_llm_call(
+            session_id="s", conversation_history=[{"role": "user", "content": "do the thing"}]
+        )
+        context = res["context"]
+        self.assertIn("Advisor redraft guidance", context)
+        self.assertIn("no deploy tool ran", context)
+
+    def test_rejection_guidance_cleared_on_new_request(self):
+        class MockCtx:
+            class MockLLM:
+                def complete(self, **kwargs):
+                    raise AssertionError("no LLM call expected")
+
+            llm = MockLLM()
+
+        rt = runtime_mod.AdvisorRuntime(MockCtx())
+        rt.state.enabled = True
+        rt._record_rejection("s", {"reason": "unbacked claim"}, runtime_mod._user_key("do the thing"))
+        res = rt.on_pre_llm_call(
+            session_id="s", conversation_history=[{"role": "user", "content": "a different task"}]
+        )
+        self.assertNotIn("Advisor redraft guidance", res["context"])
+        self.assertNotIn("s", rt._rejections)
+
+    def test_redraft_escalation_after_two_rejections(self):
+        prompts = []
+
+        class MockLLMResult:
+            def __init__(self, text):
+                self.text = text
+
+        class MockCtx:
+            class MockLLM:
+                def complete(self, **kwargs):
+                    prompts.append(kwargs["messages"][0]["content"])
+                    return MockLLMResult('{"status": "rejected", "reason": "missing detail"}')
+
+            llm = MockLLM()
+
+        rt = runtime_mod.AdvisorRuntime(MockCtx())
+        rt.state.enabled = True
+        rt._session_history["s"] = [{"role": "user", "content": "do the thing"}]
+        for _ in range(3):
+            rt.verify_turn(draft="Everything is in place for the next run.", session_id="s")
+
+        self.assertEqual(len(prompts), 3)
+        self.assertNotIn("REDRAFT ESCALATION", prompts[1])
+        self.assertIn("REDRAFT ESCALATION", prompts[2])
+        self.assertEqual(rt._rejections["s"]["count"], 3)
+
+    def test_approval_clears_rejection_state(self):
+        class MockLLMResult:
+            def __init__(self, text):
+                self.text = text
+
+        class MockCtx:
+            class MockLLM:
+                def complete(self, **kwargs):
+                    return MockLLMResult('{"status": "approved", "reason": "ok"}')
+
+            llm = MockLLM()
+
+        rt = runtime_mod.AdvisorRuntime(MockCtx())
+        rt.state.enabled = True
+        rt._session_history["s"] = [{"role": "user", "content": "do the thing"}]
+        rt._record_rejection("s", {"reason": "unbacked claim"}, runtime_mod._user_key("do the thing"))
+        rt.verify_turn(draft="Everything is in place for the next run.", session_id="s")
+        self.assertNotIn("s", rt._rejections)
+
     def test_pre_verify_nudge_on_issue(self):
         class MockLLMResult:
             def __init__(self, text):
