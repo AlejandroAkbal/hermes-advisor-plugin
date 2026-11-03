@@ -541,6 +541,54 @@ class TestAdvisorRuntime(unittest.TestCase):
         self.assertIn("Verification Gate", ctx_dict.get("context", ""))
         self.assertEqual(len(rt._turn_tool_events.get("s1", [])), 0)
 
+    def test_turn_events_survive_llm_calls_within_one_request(self):
+        class MockCtx:
+            pass
+        rt = runtime_mod.AdvisorRuntime(MockCtx())
+        history = [{"role": "user", "content": "ship the fix"}]
+        rt.on_pre_llm_call(session_id="s1", conversation_history=history)
+        rt.record_tool_call(tool_name="terminal", args={"command": "gh pr view 26"}, result="state: MERGED", session_id="s1")
+        rt.on_pre_llm_call(session_id="s1", conversation_history=history)
+        rt.record_tool_call(tool_name="terminal", args={"command": "pytest"}, result="OK", session_id="s1")
+        rt.on_pre_llm_call(session_id="s1", conversation_history=history)
+        self.assertEqual(len(rt._turn_tool_events.get("s1", [])), 2)
+
+    def test_turn_events_clear_on_new_user_request(self):
+        class MockCtx:
+            pass
+        rt = runtime_mod.AdvisorRuntime(MockCtx())
+        first = [{"role": "user", "content": "ship the fix"}]
+        rt.on_pre_llm_call(session_id="s1", conversation_history=first)
+        rt.record_tool_call(tool_name="terminal", args={"command": "ls"}, result="output", session_id="s1")
+        rt.on_pre_llm_call(session_id="s1", conversation_history=first)
+        self.assertEqual(len(rt._turn_tool_events.get("s1", [])), 1)
+        second = [{"role": "user", "content": "ship the fix"}, {"role": "assistant", "content": "done"}, {"role": "user", "content": "now do something else"}]
+        rt.on_pre_llm_call(session_id="s1", conversation_history=second)
+        self.assertEqual(len(rt._turn_tool_events.get("s1", [])), 0)
+
+    def test_turn_id_resets_even_with_identical_request_text(self):
+        class MockCtx:
+            pass
+        rt = runtime_mod.AdvisorRuntime(MockCtx())
+        history = [{"role": "user", "content": "run it again"}]
+        rt.on_pre_llm_call(session_id="s1", conversation_history=history, turn_id="t1")
+        rt.record_tool_call(tool_name="terminal", args={"command": "ls"}, result="output", session_id="s1")
+        rt.on_pre_llm_call(session_id="s1", conversation_history=history, turn_id="t1")
+        self.assertEqual(len(rt._turn_tool_events.get("s1", [])), 1)
+        rt.on_pre_llm_call(session_id="s1", conversation_history=history, turn_id="t2")
+        self.assertEqual(len(rt._turn_tool_events.get("s1", [])), 0)
+
+    def test_turn_events_capped(self):
+        class MockCtx:
+            pass
+        rt = runtime_mod.AdvisorRuntime(MockCtx())
+        history = [{"role": "user", "content": "ship the fix"}]
+        rt.on_pre_llm_call(session_id="s1", conversation_history=history)
+        for i in range(runtime_mod.MAX_TURN_EVENTS + 5):
+            rt.record_tool_call(tool_name="terminal", args={"command": f"echo {i}"}, result="ok", session_id="s1")
+        rt.on_pre_llm_call(session_id="s1", conversation_history=history)
+        self.assertEqual(len(rt._turn_tool_events.get("s1", [])), runtime_mod.MAX_TURN_EVENTS)
+
     def test_collect_directives_filtering_and_unwrap(self):
         collect = runtime_mod._collect_directives
         raw_msgs = [

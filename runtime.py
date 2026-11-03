@@ -34,6 +34,8 @@ AUDIT_RECENT_EVENT_CHARS = 4_000
 AUDIT_OLDER_EVENT_CHARS = 400
 # Room kept back per event for the header, args and the truncation marker.
 AUDIT_EVENT_HEADER_RESERVE = 400
+# Hard ceiling on retained tool events per user turn, so a long turn cannot grow unbounded.
+MAX_TURN_EVENTS = 200
 
 _SECRET_PATTERNS = (
     re.compile(r"sk-[a-zA-Z0-9_-]{20,}"),
@@ -362,6 +364,7 @@ class AdvisorRuntime:
         self.state = self._load_state()
         self._session_states: dict[str, AdvisorState] = {}
         self._turn_tool_events: dict[str, list[dict]] = {}
+        self._turn_keys: dict[str, str] = {}
         self._turn_verified: dict[str, bool] = {}
         self._session_history: dict[str, list[dict]] = {}
         # Last rejection per session, replayed as guidance on the redraft.
@@ -572,6 +575,7 @@ class AdvisorRuntime:
         with self._state_lock:
             self._session_history.pop(sess, None)
             self._turn_tool_events.pop(sess, None)
+            self._turn_keys.pop(sess, None)
             self._turn_verified.pop(sess, None)
             self._session_states.pop(sess, None)
 
@@ -717,6 +721,9 @@ class AdvisorRuntime:
                 "args": clean_args,
                 "result": res_str,
             })
+            events = self._turn_tool_events[sess]
+            if len(events) > MAX_TURN_EVENTS:
+                del events[:-MAX_TURN_EVENTS]
 
     def _session_messages(self, session_id: str = "", limit: int = 20) -> list[dict]:
         """Fetch recent session messages from state.db for rich context."""
@@ -743,14 +750,19 @@ class AdvisorRuntime:
         """Inject verification directive into active turn context for all sessions."""
         sess = session_id or "default"
         history = kwargs.get("conversation_history")
-        last_user = ""
-        if history:
+        last_user = str(kwargs.get("user_message") or "")
+        if history and not last_user:
             for m in reversed(history):
                 if isinstance(m, dict) and m.get("role") == "user":
                     last_user = str(m.get("content") or "")
                     break
         with self._state_lock:
-            self._turn_tool_events[sess] = []
+            turn_id = str(kwargs.get("turn_id") or "")
+            request_key = turn_id or (_user_key(last_user) if last_user else "")
+            if not request_key or self._turn_keys.get(sess) != request_key:
+                self._turn_tool_events[sess] = []
+            if request_key:
+                self._turn_keys[sess] = request_key
             self._turn_verified[sess] = False
             if history:
                 self._session_history[sess] = list(history[-20:])
