@@ -106,7 +106,7 @@ def _log(message: str) -> None:
         handle.write(f"{stamp} {message}\n")
 
 
-def _restart_worker(repo: Path, wait_seconds: int) -> int:
+def _restart_worker(repo: Path, wait_seconds: int, signal_only: bool = False) -> int:
     _log(f"restart scheduled in {wait_seconds}s for {repo}")
     time.sleep(wait_seconds)
     pid = gateway_pid()
@@ -119,6 +119,8 @@ def _restart_worker(repo: Path, wait_seconds: int) -> int:
         _log(f"signal failed: {exc}")
         return 5
     _log(f"SIGUSR1 sent to {pid}")
+    if signal_only:
+        return 0
     deadline = time.time() + DRAIN_GRACE_SECONDS + 180
     while time.time() < deadline:
         time.sleep(5)
@@ -130,9 +132,9 @@ def _restart_worker(repo: Path, wait_seconds: int) -> int:
     return 5
 
 
-def restart(repo: Path, wait_seconds: int, detach: bool) -> int:
+def restart(repo: Path, wait_seconds: int, detach: bool, signal_only: bool = False) -> int:
     if not detach:
-        return _restart_worker(repo, wait_seconds)
+        return _restart_worker(repo, wait_seconds, signal_only)
     if os.fork() != 0:
         print(f"restart detached; log: {LOG_PATH}")
         return 0
@@ -140,7 +142,7 @@ def restart(repo: Path, wait_seconds: int, detach: bool) -> int:
     with open(os.devnull, "w") as devnull:
         os.dup2(devnull.fileno(), 1)
         os.dup2(devnull.fileno(), 2)
-    os._exit(_restart_worker(repo, wait_seconds))
+    os._exit(_restart_worker(repo, wait_seconds, signal_only))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -149,10 +151,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo", type=Path, default=PLUGIN_ROOT)
     parser.add_argument("--wait-seconds", type=int, default=120)
     parser.add_argument("--no-detach", action="store_true")
+    parser.add_argument("--signal-only", action="store_true", help="send the signal and exit without waiting")
     args = parser.parse_args(argv)
     if args.command == "check":
         return check(args.repo)
-    return restart(args.repo, args.wait_seconds, detach=not args.no_detach)
+    return restart(args.repo, args.wait_seconds, detach=not args.no_detach, signal_only=args.signal_only)
 
 
 if __name__ == "__main__":
