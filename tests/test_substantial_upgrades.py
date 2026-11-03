@@ -773,19 +773,27 @@ class TestActiveProber(unittest.TestCase):
             tag_probe = next(p for p in probes if "tag v2.0.0 exists" in p.claim)
             self.assertTrue(tag_probe.success)
 
-            # Negated assertions should not trigger affirmative probes
-            negated_draft = "I have not installed fake_cli CLI, and the release is not tagged as v9.9.9."
+            # Negated assertions (with or without intervening words) should not trigger affirmative probes
+            negated_draft = "We did not create git tag v9.9.9, and have not yet installed fake_cli CLI."
             neg_probes = run_active_probes_for_draft(negated_draft, tmp_dir)
             neg_claims = [p.claim for p in neg_probes]
             self.assertFalse(any("fake_cli" in c for c in neg_claims))
             self.assertFalse(any("v9.9.9" in c for c in neg_claims))
 
-            # Git tag with option flags such as -a or -m captures the tag name rather than the flag
-            opt_draft = "Ran git tag -a v2.0.0 for release."
+            # Git tag with options and message flags captures tag name and not message string
+            opt_draft = 'Ran git tag -a -m "release v2" v2.0.0 for release.'
             opt_probes = run_active_probes_for_draft(opt_draft, tmp_dir)
             opt_claims = [p.claim for p in opt_probes]
             self.assertTrue(any("tag v2.0.0 exists" in c for c in opt_claims))
             self.assertFalse(any("-a" in c for c in opt_claims))
+            self.assertFalse(any("release" in c for c in opt_claims))
+
+            # Tag names with build metadata (+) are fully matched
+            subprocess.run(["git", "tag", "v2.0.0+build.1"], cwd=tmp_dir, check=True, capture_output=True)
+            plus_draft = "The release is tagged as v2.0.0+build.1."
+            plus_probes = run_active_probes_for_draft(plus_draft, tmp_dir)
+            plus_claims = [p.claim for p in plus_probes]
+            self.assertTrue(any("tag v2.0.0+build.1 exists" in c for c in plus_claims))
 
             # Tag probe budget bounds execution to at most MAX_TAG_PROBES
             many_tags = " ".join(f"tagged as v1.0.{i}" for i in range(20))
