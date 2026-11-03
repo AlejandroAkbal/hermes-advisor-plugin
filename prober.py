@@ -591,6 +591,12 @@ def _extract_tag_names(draft: str) -> list[str]:
     return tags
 
 
+FILLER_WORDS = {
+    "was", "were", "has", "have", "been", "already", "now", "still", "also", "just", "successfully",
+    "exists", "exist", "created", "present", "is", "are", "defined", "set",
+}
+
+
 def _extract_directory_paths(draft: str, cwd: str) -> list[str]:
     """Safely extract claimed directory/folder paths from draft, filtering negations."""
     patterns = [
@@ -608,9 +614,10 @@ def _extract_directory_paths(draft: str, cwd: str) -> list[str]:
             if _is_negated_claim(draft, m.start()):
                 continue
             cand = m.group(1).strip().rstrip(".,;:!?)'\"")
-            if not cand or cand.lower() in ignored:
+            cand_lower = cand.lower()
+            if not cand or cand_lower in ignored or cand_lower in FILLER_WORDS:
                 continue
-            if "/" in cand or cand.startswith("~") or cand.startswith(".") or re.fullmatch(r"[a-zA-Z0-9_\-]+", cand):
+            if "/" in cand or cand.startswith(("~", ".")) or re.fullmatch(r"[a-zA-Z0-9_\-]+", cand):
                 expanded = os.path.expanduser(cand)
                 if not os.path.isabs(expanded):
                     expanded = os.path.abspath(os.path.join(cwd, expanded))
@@ -631,7 +638,8 @@ def _extract_git_remotes(draft: str) -> list[str]:
             if _is_negated_claim(draft, m.start()):
                 continue
             cand = m.group(1).strip().rstrip(".,;:!?)'\"")
-            if not cand or cand.startswith("-") or cand.lower() in ignored_remotes:
+            cand_lower = cand.lower()
+            if not cand or cand.startswith("-") or cand_lower in ignored_remotes or cand_lower in FILLER_WORDS:
                 continue
             remotes.append(cand)
     return remotes
@@ -650,7 +658,7 @@ def _extract_env_vars(draft: str) -> list[str]:
             if _is_negated_claim(draft, m.start()):
                 continue
             cand = m.group(1).strip()
-            if not cand or cand.upper() in ignored_vars or len(cand) > 128:
+            if not cand or cand.upper() in ignored_vars or cand.lower() in FILLER_WORDS or len(cand) > 128:
                 continue
             vars_list.append(cand)
     return vars_list

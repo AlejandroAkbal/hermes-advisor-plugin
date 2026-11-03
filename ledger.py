@@ -162,28 +162,9 @@ def _pr_view_indicates_merged(res_str: str) -> bool:
 
 def _extract_merged_pr_number(args_str: str, res_str: str) -> str | None:
     """Extract actual merged PR number from gh pr merge/view command arguments or URL."""
-    res_clean = res_str.strip()
-    if res_clean.startswith("{") and res_clean.endswith("}"):
-        try:
-            data = json.loads(res_clean)
-            if isinstance(data, dict) and "number" in data:
-                return str(data["number"])
-        except Exception:
-            pass
-    if re.search(r"\bgh\s+pr\s+merge\b", args_str):
-        url_m = re.search(r"https?://github\.com/[^/\s]+/[^/\s]+/pull/(\d+)", res_str)
-        if url_m:
-            return url_m.group(1)
-        res_m = re.search(r"(?i)\b(?:merged\s+)?(?:pull request|pr)\s+(?:[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)?#?(\d+)\b", res_str)
-        if res_m:
-            return res_m.group(1)
-        num_m = re.search(r"(?<!\w)#(\d+)\b", res_str)
-        if num_m:
-            return num_m.group(1)
-
     try:
         tokens = shlex.split(args_str)
-    except Exception:
+    except ValueError:
         tokens = args_str.split()
 
     subcmd_idx = -1
@@ -194,8 +175,9 @@ def _extract_merged_pr_number(args_str: str, res_str: str) -> str | None:
 
     if subcmd_idx != -1:
         opts_with_val = {
-            "-b", "--body", "-F", "--body-file", "-t", "--title", "-s", "--subject",
-            "-R", "--repo", "-m", "--match-head-commit", "-q", "--jq", "--template"
+            "-b", "--body", "-F", "--body-file", "-t", "--subject", "--template",
+            "-A", "--author-email", "-R", "--repo", "--match-head-commit",
+            "-q", "--jq", "--json",
         }
         idx = subcmd_idx + 1
         while idx < len(tokens):
@@ -209,10 +191,29 @@ def _extract_merged_pr_number(args_str: str, res_str: str) -> str | None:
             url_match = re.search(r"https?://github\.com/[^/\s]+/[^/\s]+/pull/(\d+)", tok)
             if url_match:
                 return url_match.group(1)
-            num_match = re.search(r"^(?:[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)?#?(\d+)$", tok)
+            num_match = re.search(r"^(?:(?:[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)?#)?(\d+)$", tok)
             if num_match:
                 return num_match.group(1)
             idx += 1
+
+    res_clean = res_str.strip()
+    if res_clean.startswith("{") and res_clean.endswith("}"):
+        try:
+            data = json.loads(res_clean)
+            if isinstance(data, dict) and "number" in data:
+                return str(data["number"])
+        except Exception:
+            pass
+    if re.search(r"\bgh\s+pr\s+merge\b", args_str):
+        url_m = re.search(r"https?://github\.com/[^/\s]+/[^/\s]+/pull/(\d+)", res_str)
+        if url_m:
+            return url_m.group(1)
+        res_m = re.search(r"(?i)\b(?:merged\s+)?(?:pull request|pr)\s+(?:(?:[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)?#)?(\d+)\b", res_str)
+        if res_m:
+            return res_m.group(1)
+        num_m = re.search(r"(?<!\w)#(\d+)\b", res_str)
+        if num_m:
+            return num_m.group(1)
 
     return None
 
@@ -272,8 +273,11 @@ def audit_draft_ledger(
                 rule="placeholder_draft"
             )
 
+    # Exclude non-execution advisory tools from execution matching
+    _NON_EXECUTION_TOOLS = {"consult_advisor"}
+    exec_events = [ev for ev in tool_events if ev.get("tool") not in _NON_EXECUTION_TOOLS]
     combined_tool_text = " ".join(
-        f"{ev.get('tool', '')} {ev.get('args', '')}" for ev in tool_events
+        f"{ev.get('tool', '')} {ev.get('args', '')}" for ev in exec_events
     )
     valid_evidence_lines = []
     if evidence:
@@ -295,7 +299,7 @@ def audit_draft_ledger(
         if rule_match:
             # Check if any required pattern was executed in tool events
             matching_events = [
-                ev for ev in tool_events
+                ev for ev in exec_events
                 if any(
                     re.search(req_pat, f"{ev.get('tool', '')} {ev.get('args', '')}", re.IGNORECASE)
                     for req_pat in rule["required_tool_patterns"]

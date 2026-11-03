@@ -640,8 +640,9 @@ class AdvisorRuntime:
         with self._state_lock:
             if sess not in self._turn_tool_events:
                 self._turn_tool_events[sess] = []
-            # Any new action invalidates a prior approval for this turn.
-            self._turn_verified[sess] = False
+            # Any new action invalidates a prior approval for this turn (advisory calls do not mutate state).
+            if tool_name != "consult_advisor":
+                self._turn_verified[sess] = False
             res_str = str(result) if result is not None else ""
             res_str = _redact_secrets(res_str)
             if len(res_str) > 2000:
