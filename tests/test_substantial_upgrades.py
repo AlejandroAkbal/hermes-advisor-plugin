@@ -1074,6 +1074,26 @@ class TestDialecticAuditor(unittest.TestCase):
         v_mg = audit_draft_ledger("Merged PR #23 successfully.", tool_events=events_merge)
         self.assertTrue(v_mg.passed, f"Expected pass for merge short flag, got {v_mg.reason}")
 
+    def test_pr_merged_with_dict_args(self):
+        # When tool event args is a dictionary with a "command" key
+        events = [{
+            "tool": "terminal",
+            "args": {"command": "gh pr merge 23 --merge"},
+            "result": "✓ Merged successfully",
+        }]
+        v = audit_draft_ledger("Merged PR #23 successfully.", tool_events=events)
+        self.assertTrue(v.passed, f"Expected pass for dict-shaped args, got {v.reason}")
+
+    def test_advisory_errors_do_not_trigger_unacknowledged_failure(self):
+        # An advisory result quoting an error should not trigger unacknowledged tool failure
+        events = [{
+            "tool": "consult_advisor",
+            "args": {"task": "how to fix SyntaxError"},
+            "result": "SyntaxError: invalid syntax in file.py",
+        }]
+        v = audit_draft_ledger("Everything works.", tool_events=events)
+        self.assertTrue(v.passed)
+
     def test_filler_words_rejected_by_extractors(self):
         # Auxiliary words like 'was' and 'already' must not become probe targets
         draft = "The directory was created. The remote already exists. Environment variable was set."
@@ -1088,7 +1108,7 @@ class TestDialecticAuditor(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             subprocess.run(["git", "init"], cwd=tmpdir, check=True, capture_output=True)
             subprocess.run(
-                ["git", "remote", "add", "origin", "https://user:secret123@github.com/example/repo.git"],
+                ["git", "remote", "add", "origin", "https://user:p@ssword123@github.com/example/repo.git"],
                 cwd=tmpdir,
                 check=True,
                 capture_output=True,
@@ -1097,8 +1117,9 @@ class TestDialecticAuditor(unittest.TestCase):
             self.assertIsNotNone(res)
             self.assertTrue(res.executed)
             self.assertTrue(res.success)
-            self.assertNotIn("secret123", res.output)
-            self.assertIn("user:***@github.com", res.output)
+            self.assertNotIn("p@ssword123", res.output)
+            self.assertNotIn("ssword", res.output)
+            self.assertIn("***@github.com", res.output)
 
     def test_bare_directory_extraction(self):
         with tempfile.TemporaryDirectory() as tmpdir:

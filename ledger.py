@@ -160,8 +160,14 @@ def _pr_view_indicates_merged(res_str: str) -> bool:
     return bool(re.search(r"(?im)^\s*state:\s*merged\s*$", res_str))
 
 
-def _extract_merged_pr_number(args_str: str, res_str: str) -> str | None:
+def _extract_merged_pr_number(args_input: Any, res_str: str) -> str | None:
     """Extract actual merged PR number from gh pr merge/view command arguments or URL."""
+    if isinstance(args_input, dict):
+        cmd = args_input.get("command")
+        args_str = cmd if isinstance(cmd, str) else str(args_input)
+    else:
+        args_str = str(args_input or "")
+
     try:
         tokens = shlex.split(args_str)
     except ValueError:
@@ -371,7 +377,9 @@ def audit_draft_ledger(
                     matching_success = False
                     for ev in matching_events:
                         res_str = str(ev.get("result", ""))
-                        args_str = str(ev.get("args", ""))
+                        raw_args = ev.get("args", "")
+                        command = raw_args.get("command") if isinstance(raw_args, dict) else None
+                        args_str = command if isinstance(command, str) else str(raw_args)
                         if not _result_indicates_failure(res_str):
                             if re.search(r"\bgh\s+pr\s+view\b", args_str):
                                 if is_action_claim:
@@ -435,10 +443,10 @@ def audit_draft_ledger(
 
     # 3. Check for severe unhandled tool errors if draft claims unqualified success
     claims_clean_success = re.search(r"(?i)\b(all clean|succeeded|done successfully|everything works?|healthy)\b", scan_text)
-    if claims_clean_success and tool_events:
+    if claims_clean_success and exec_events:
         # Check only the final execution result per tool to avoid flagging retried/recovered commands
         latest_event_per_tool = {}
-        for ev in tool_events:
+        for ev in exec_events:
             tool_name = ev.get("tool", "")
             if tool_name:
                 latest_event_per_tool[tool_name] = ev

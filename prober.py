@@ -433,10 +433,7 @@ def probe_git_tag(tag_name: str, cwd: str) -> ProbeResult | None:
 
 def _redact_url_credentials(url: str) -> str:
     """Redact embedded credentials from git URLs before exposing in evidence."""
-    redacted = re.sub(r"://([^/@:\s]+):([^/@\s]+)@", r"://\1:***@", url)
-    if "://" in redacted:
-        redacted = re.sub(r"://([^/@\s:]+)@", r"://***@", redacted)
-    return redacted
+    return re.sub(r"^([a-zA-Z][a-zA-Z0-9+.-]*://)[^/\s]*@", r"\1***@", url)
 
 
 def probe_git_remote(remote_name: str, cwd: str) -> ProbeResult | None:
