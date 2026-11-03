@@ -5,10 +5,12 @@ without requiring an extra agent turn:
 - Repo clean state (git status --porcelain)
 - Current git branch (git branch --show-current)
 - Git commit verification (git log -1)
+- Git tag verification (git tag -l)
 - File existence / non-empty checks (test -e)
 - Service presence (launchctl list)
-- Process PID presence (ps -p)
+- Process PID presence & zombie rejection (ps -p)
 - TCP port listening state (lsof -iTCP -sTCP:LISTEN)
+- Command / CLI availability in PATH (which / shutil.which)
 
 All probes are bounded by strict timeouts (<= 2.0s) and executed in a read-only manner.
 """
@@ -17,16 +19,19 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import socket
 import subprocess
-from typing import Any
 
 PROBE_TIMEOUT_SECONDS = 2.0
 PID_LIMIT = 4_194_304  # Linux pid_max ceiling; pid_max itself is not allocated
 
 
 class ProbeResult:
-    def __init__(self, executed: bool, success: bool, claim: str, command: str, output: str):
+    """Encapsulates the outcome of a read-only active probe."""
+
+    def __init__(self, executed: bool, success: bool, claim: str, command: str, output: str) -> None:
+        """Initialize probe result with execution outcome and output details."""
         self.executed = executed
         self.success = success
         self.claim = claim
@@ -34,6 +39,7 @@ class ProbeResult:
         self.output = output.strip()
 
     def format_evidence(self) -> str:
+        """Format probe outcome into an evidence line for the auditor."""
         if not self.executed:
             status_str = "INCONCLUSIVE"
         else:
@@ -51,6 +57,7 @@ def _is_git_work_tree(cwd: str) -> bool:
             capture_output=True,
             text=True,
             timeout=PROBE_TIMEOUT_SECONDS,
+            check=False,
         )
         return res.returncode == 0 and res.stdout.strip() == "true"
     except Exception:
@@ -68,6 +75,7 @@ def probe_git_clean_status(cwd: str) -> ProbeResult | None:
             capture_output=True,
             text=True,
             timeout=PROBE_TIMEOUT_SECONDS,
+            check=False,
         )
         if proc.returncode == 0:
             is_clean = len(proc.stdout.strip()) == 0
@@ -101,6 +109,7 @@ def probe_git_branch(cwd: str) -> ProbeResult | None:
             capture_output=True,
             text=True,
             timeout=PROBE_TIMEOUT_SECONDS,
+            check=False,
         )
         if proc.returncode == 0:
             branch = proc.stdout.strip()
@@ -142,6 +151,7 @@ def probe_service_running(label: str) -> ProbeResult | None:
             capture_output=True,
             text=True,
             timeout=PROBE_TIMEOUT_SECONDS,
+            check=False,
         )
         if proc.returncode == 0:
             for line in proc.stdout.splitlines():
@@ -179,6 +189,7 @@ def probe_port_listening(port: int) -> ProbeResult:
             capture_output=True,
             text=True,
             timeout=PROBE_TIMEOUT_SECONDS,
+            check=False,
         )
         if proc.returncode == 0:
             lines = [
@@ -239,43 +250,56 @@ def probe_port_listening(port: int) -> ProbeResult:
 
 
 def probe_process_running(pid: int) -> ProbeResult:
-    """Safely probe if a process with given PID is running on the host."""
+    """Safely probe if a process with given PID is running and not a zombie on the host."""
     if pid <= 0 or pid >= PID_LIMIT:
         return ProbeResult(
             executed=False,
             success=False,
             claim=f"process PID {pid} running",
-            command=f"ps -p {pid} -o pid=,user=,comm=",
+            command=f"ps -p {pid} -o pid=,stat=,user=,comm=",
             output=f"Invalid PID: {pid}",
         )
     try:
         proc = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "pid=,user=,comm="],
+            ["ps", "-p", str(pid), "-o", "pid=,stat=,user=,comm="],
             capture_output=True,
             text=True,
             timeout=PROBE_TIMEOUT_SECONDS,
+            check=False,
         )
         if proc.returncode == 0 and proc.stdout.strip():
+            lines = proc.stdout.strip().splitlines()
+            data_line = lines[0].strip()
+            fields = data_line.split()
+            # fields: [pid, stat, user, comm...]
+            if len(fields) >= 2 and (fields[1].startswith("Z") or "<defunct>" in data_line):
+                return ProbeResult(
+                    executed=True,
+                    success=False,
+                    claim=f"process PID {pid} running",
+                    command=f"ps -p {pid} -o pid=,stat=,user=,comm=",
+                    output=f"PID {pid} is a zombie process: {data_line}",
+                )
             return ProbeResult(
                 executed=True,
                 success=True,
                 claim=f"process PID {pid} running",
-                command=f"ps -p {pid} -o pid=,user=,comm=",
-                output=proc.stdout.strip(),
+                command=f"ps -p {pid} -o pid=,stat=,user=,comm=",
+                output=data_line,
             )
         if proc.returncode != 0 and proc.stderr.strip():
             return ProbeResult(
                 executed=False,
                 success=False,
                 claim=f"process PID {pid} running",
-                command=f"ps -p {pid} -o pid=,user=,comm=",
+                command=f"ps -p {pid} -o pid=,stat=,user=,comm=",
                 output=f"Probe inconclusive: {proc.stderr.strip()}",
             )
         return ProbeResult(
             executed=True,
             success=False,
             claim=f"process PID {pid} running",
-            command=f"ps -p {pid} -o pid=,user=,comm=",
+            command=f"ps -p {pid} -o pid=,stat=,user=,comm=",
             output=f"PID {pid} not found",
         )
     except Exception as e:
@@ -283,7 +307,7 @@ def probe_process_running(pid: int) -> ProbeResult:
             executed=False,
             success=False,
             claim=f"process PID {pid} running",
-            command=f"ps -p {pid} -o pid=,user=,comm=",
+            command=f"ps -p {pid} -o pid=,stat=,user=,comm=",
             output=f"Probe inconclusive: {e}",
         )
 
@@ -299,6 +323,7 @@ def probe_git_commit(commit_ref: str, cwd: str) -> ProbeResult | None:
             capture_output=True,
             text=True,
             timeout=PROBE_TIMEOUT_SECONDS,
+            check=False,
         )
         if proc.returncode == 0 and proc.stdout.strip():
             return ProbeResult(
@@ -334,29 +359,103 @@ def probe_git_commit(commit_ref: str, cwd: str) -> ProbeResult | None:
         )
 
 
+def probe_git_tag(tag_name: str, cwd: str) -> ProbeResult | None:
+    """Safely probe if a git tag exists in the repository."""
+    if not _is_git_work_tree(cwd):
+        return None
+    clean_tag = tag_name.strip()
+    if not re.fullmatch(r"[a-zA-Z0-9_\-\.\/]+", clean_tag) or len(clean_tag) > 100:
+        return None
+    try:
+        proc = subprocess.run(
+            ["git", "--no-optional-locks", "-C", cwd, "tag", "-l", clean_tag],
+            capture_output=True,
+            text=True,
+            timeout=PROBE_TIMEOUT_SECONDS,
+            check=False,
+        )
+        if proc.returncode == 0:
+            found_tags = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+            is_found = clean_tag in found_tags
+            output_str = f"tag {clean_tag} exists" if is_found else f"tag {clean_tag} not found"
+            return ProbeResult(
+                executed=True,
+                success=is_found,
+                claim=f"git tag {clean_tag} exists",
+                command=f"git -C {cwd} tag -l {clean_tag}",
+                output=output_str,
+            )
+        return ProbeResult(
+            executed=False,
+            success=False,
+            claim=f"git tag {clean_tag} exists",
+            command=f"git -C {cwd} tag -l {clean_tag}",
+            output=f"Probe inconclusive: git exit code {proc.returncode} {proc.stderr.strip()}".strip(),
+        )
+    except Exception as e:
+        return ProbeResult(
+            executed=False,
+            success=False,
+            claim=f"git tag {clean_tag} exists",
+            command=f"git -C {cwd} tag -l {clean_tag}",
+            output=f"Probe inconclusive: {e}",
+        )
+
+
+def probe_command_available(command_name: str) -> ProbeResult:
+    """Safely probe if an executable binary or CLI command is installed and available in PATH."""
+    clean_name = command_name.strip()
+    if not re.fullmatch(r"[a-zA-Z0-9_\-\.]+", clean_name) or len(clean_name) > 64:
+        return ProbeResult(
+            executed=False,
+            success=False,
+            claim=f"command {command_name} available",
+            command=f"which {command_name}",
+            output=f"Invalid command name: {command_name}",
+        )
+    resolved_path = shutil.which(clean_name)
+    if resolved_path:
+        return ProbeResult(
+            executed=True,
+            success=True,
+            claim=f"command {clean_name} available",
+            command=f"which {clean_name}",
+            output=f"{clean_name} available at {resolved_path}",
+        )
+    return ProbeResult(
+        executed=True,
+        success=False,
+        claim=f"command {clean_name} available",
+        command=f"which {clean_name}",
+        output=f"{clean_name} not found in PATH",
+    )
+
+
 def run_active_probes_for_draft(draft: str, cwd: str) -> list[ProbeResult]:
     """Inspect draft for verifiable assertions and run safe read-only probes."""
+    # Cap scanned draft length to prevent pathological scanning overhead
+    scan_draft = draft[:50000] if draft else ""
     probes: list[ProbeResult] = []
 
     # 1. Probe git clean status if asserted
-    if re.search(r"(?i)\b(working tree (is )?clean|git status clean|clean working tree|git tree (is )?clean|no uncommitted changes)\b", draft):
+    if re.search(r"(?i)\b(working tree (is )?clean|git status clean|clean working tree|git tree (is )?clean|no uncommitted changes)\b", scan_draft):
         res = probe_git_clean_status(cwd)
         if res:
             probes.append(res)
 
     # 2. Probe service running if asserted
     service_labels: set[str] = set()
-    if re.search(r"(?i)\b(ai\.hermes\.gateway|gateway is running|gateway restarted)\b", draft):
+    if re.search(r"(?i)\b(ai\.hermes\.gateway|gateway is running|gateway restarted)\b", scan_draft):
         service_labels.add("ai.hermes.gateway")
 
     # Match domain-style launchd service/daemon labels (e.g. com.alejandro.hermes-chrome, ai.hermes.gateway)
     found_labels = re.findall(
         r"(?i)\b(?:service|daemon|LaunchAgent|LaunchDaemon)\s+[`'\"]?([a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]+)+)[`'\"]?",
-        draft,
+        scan_draft,
     )
     found_labels += re.findall(
         r"(?i)\b([a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]+)+\.?)(?:\s+(?:service|daemon))?\s+(?:is\s+)?(?:running|alive|active|restarted)\b",
-        draft,
+        scan_draft,
     )
     ignored_label_extensions = {
         "com", "org", "net", "io", "dev", "app", "js", "py", "json", "yml", "yaml", "md", "txt", "html", "sh", "ts", "log", "conf", "cfg"
@@ -375,28 +474,27 @@ def run_active_probes_for_draft(draft: str, cwd: str) -> list[ProbeResult]:
     # 3. Probe git branch if claimed with explicit branch wording
     branch_m = re.search(
         r"(?i)\b(?:switched to branch|checked out branch|on feature branch|on branch)\s+(?:branch\s+)?([a-zA-Z0-9_\-\.\/]+)\b",
-        draft,
+        scan_draft,
     )
     if branch_m:
         claimed_branch = branch_m.group(1).strip()
         stop_words = {"the", "a", "an", "our", "this", "that", "clean", "dirty", "and", "or", "to", "is", "for", "with", "all", "tests", "parity", "flags"}
-        if claimed_branch.lower() not in stop_words:
-            if re.search(r"[/\-_0-9]", claimed_branch) or claimed_branch.lower() in {"main", "master", "dev", "develop"}:
-                res = probe_git_branch(cwd)
-                if res and res.executed:
-                    res.success = (res.output == claimed_branch)
-                    res.claim = f"on branch {claimed_branch}"
-                    probes.append(res)
+        if claimed_branch.lower() not in stop_words and (re.search(r"[/\-_0-9]", claimed_branch) or claimed_branch.lower() in {"main", "master", "dev", "develop"}):
+            res = probe_git_branch(cwd)
+            if res and res.executed:
+                res.success = (res.output == claimed_branch)
+                res.claim = f"on branch {claimed_branch}"
+                probes.append(res)
 
     # 4. Probe file existence if explicit file creation or existence is asserted with a path-like token
     ext_pattern = r"(?:py|json|ya?ml|toml|md|txt|ts|js|sh|html|css|rs|go|log|lock|conf|cfg|ini|sql)"
     post_verb_matches = re.findall(
         rf"(?i)(?<!not )(?<!never )(?<!n't )\b(?:created|written\s+to|written\s+into|saved|added)\s+(?:in|to|at)?\s*[`'\"]?([/~a-zA-Z0-9_\-./]+(?:\.{ext_pattern}))[`'\"]?",
-        draft,
+        scan_draft,
     )
     pre_verb_matches = re.findall(
         rf"(?i)(?<!not )(?<!never )(?<!n't )[`'\"]?([/~a-zA-Z0-9_\-./]+(?:\.{ext_pattern}))[`'\"]?\s+exists?\b",
-        draft,
+        scan_draft,
     )
     ignored_basenames = {"node.js", "react.js", "vue.js", "next.js", "deno.js"}
     for p in dict.fromkeys(post_verb_matches + pre_verb_matches):
@@ -410,7 +508,7 @@ def run_active_probes_for_draft(draft: str, cwd: str) -> list[ProbeResult]:
     # 5. Probe TCP port listening if explicitly asserted
     port_matches = re.findall(
         r"(?i)\b(?:listening\s+(?:on|at)\s+(?:port\s+)?(?:(?:\d{1,3}(?:\.\d{1,3}){3}|localhost):)?(\d{2,5})(?!\.\d)|bound\s+to\s+(?:port\s+)?(?:(?:\d{1,3}(?:\.\d{1,3}){3}|localhost):)?(\d{2,5})(?!\.\d)|port\s+(\d{2,5})\s+(?:is\s+)?(?:listening|open))\b",
-        draft,
+        scan_draft,
     )
     seen_ports: set[int] = set()
     for match_tuple in port_matches:
@@ -421,10 +519,10 @@ def run_active_probes_for_draft(draft: str, cwd: str) -> list[ProbeResult]:
                     seen_ports.add(port_num)
                     probes.append(probe_port_listening(port_num))
 
-    # 6. Probe process PID if explicitly asserted
+    # 6. Probe process PID if explicitly asserted (bounded character gap to prevent regex performance overhead)
     pid_matches = re.findall(
-        r"(?i)(?:\brunning\s+as\s+.*?\bPID\s+(\d{1,7})|\brunning(?:\s+\w+)?\s*\(\s*PID\s+(\d{1,7})\s*\)|\bPID\s+(\d{1,7})\s+(?:is\s+)?running|\bprocess\s+(\d{1,7})\s+(?:is\s+)?running)",
-        draft,
+        r"(?i)(?:\brunning\s+as\s+.{1,80}?[\b\s]PID\s+(\d{1,7})|\brunning(?:\s+\w+)?\s*\(\s*PID\s+(\d{1,7})\s*\)|\bPID\s+(\d{1,7})\s+(?:is\s+)?running|\bprocess\s+(\d{1,7})\s+(?:is\s+)?running)",
+        scan_draft,
     )
     seen_pids: set[int] = set()
     for match_tuple in pid_matches:
@@ -438,7 +536,7 @@ def run_active_probes_for_draft(draft: str, cwd: str) -> list[ProbeResult]:
     # 7. Probe git commit SHA if explicitly asserted
     commit_matches = re.findall(
         r"(?i)\b(?:committed\s+(?:in|as|with\s+(?:hash|sha|commit)?)\s+|commit\s+|commit\s+hash\s+|on\s+commit\s+)([0-9a-f]{7,40})\b",
-        draft,
+        scan_draft,
     )
     seen_commits: set[str] = set()
     for sha in commit_matches:
@@ -446,6 +544,44 @@ def run_active_probes_for_draft(draft: str, cwd: str) -> list[ProbeResult]:
         if sha_lower not in seen_commits:
             seen_commits.add(sha_lower)
             res = probe_git_commit(sha_lower, cwd)
+            if res:
+                probes.append(res)
+
+    # 8. Probe command/CLI availability if asserted
+    cmd_matches = re.findall(
+        r"(?i)\b(?:CLI|binary|command|tool|executable)\s+[`'\"]?([a-zA-Z0-9_\-]+)[`'\"]?\s+(?:is\s+)?(?:installed|available|present)\b",
+        scan_draft,
+    )
+    cmd_matches += re.findall(
+        r"(?i)\b[`'\"]?([a-zA-Z0-9_\-]+)[`'\"]?\s+(?:CLI|binary|tool)\s+(?:is\s+)?(?:installed|available|present)\b",
+        scan_draft,
+    )
+    cmd_matches += re.findall(
+        r"(?i)\binstalled\s+[`'\"]?([a-zA-Z0-9_\-]+)[`'\"]?\s+(?:CLI|binary|tool)\b",
+        scan_draft,
+    )
+    ignored_cmds = {
+        "the", "a", "an", "this", "that", "new", "our", "clean", "all", "each", "and", "or",
+        "not", "no", "to", "is", "for", "with", "any", "some", "it", "its", "which", "what"
+    }
+    seen_cmds: set[str] = set()
+    for c_raw in cmd_matches:
+        c_lower = c_raw.lower()
+        if c_lower not in ignored_cmds and c_lower not in seen_cmds:
+            seen_cmds.add(c_lower)
+            probes.append(probe_command_available(c_raw))
+
+    # 9. Probe git tag if asserted
+    tag_matches = re.findall(
+        r"(?i)\b(?:git\s+tag|tagged(?:\s+as)?)\s+[`'\"]?([a-zA-Z0-9_\-\.\/]+)[`'\"]?\b",
+        scan_draft,
+    )
+    seen_tags: set[str] = set()
+    for t_raw in tag_matches:
+        t_clean = t_raw.strip()
+        if t_clean.lower() not in {"the", "a", "an", "new", "latest"} and t_clean not in seen_tags:
+            seen_tags.add(t_clean)
+            res = probe_git_tag(t_clean, cwd)
             if res:
                 probes.append(res)
 
