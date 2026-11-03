@@ -721,6 +721,9 @@ class AdvisorRuntime:
                 "args": clean_args,
                 "result": res_str,
             })
+            events = self._turn_tool_events[sess]
+            if len(events) > MAX_TURN_EVENTS:
+                del events[:-MAX_TURN_EVENTS]
 
     def _session_messages(self, session_id: str = "", limit: int = 20) -> list[dict]:
         """Fetch recent session messages from state.db for rich context."""
@@ -747,21 +750,19 @@ class AdvisorRuntime:
         """Inject verification directive into active turn context for all sessions."""
         sess = session_id or "default"
         history = kwargs.get("conversation_history")
-        last_user = ""
-        if history:
+        last_user = str(kwargs.get("user_message") or "")
+        if history and not last_user:
             for m in reversed(history):
                 if isinstance(m, dict) and m.get("role") == "user":
                     last_user = str(m.get("content") or "")
                     break
         with self._state_lock:
-            request_key = _user_key(last_user) if last_user else ""
+            turn_id = str(kwargs.get("turn_id") or "")
+            request_key = turn_id or (_user_key(last_user) if last_user else "")
             if not request_key or self._turn_keys.get(sess) != request_key:
                 self._turn_tool_events[sess] = []
             if request_key:
                 self._turn_keys[sess] = request_key
-            events = self._turn_tool_events.get(sess)
-            if events and len(events) > MAX_TURN_EVENTS:
-                self._turn_tool_events[sess] = events[-MAX_TURN_EVENTS:]
             self._turn_verified[sess] = False
             if history:
                 self._session_history[sess] = list(history[-20:])

@@ -566,6 +566,18 @@ class TestAdvisorRuntime(unittest.TestCase):
         rt.on_pre_llm_call(session_id="s1", conversation_history=second)
         self.assertEqual(len(rt._turn_tool_events.get("s1", [])), 0)
 
+    def test_turn_id_resets_even_with_identical_request_text(self):
+        class MockCtx:
+            pass
+        rt = runtime_mod.AdvisorRuntime(MockCtx())
+        history = [{"role": "user", "content": "run it again"}]
+        rt.on_pre_llm_call(session_id="s1", conversation_history=history, turn_id="t1")
+        rt.record_tool_call(tool_name="terminal", args={"command": "ls"}, result="output", session_id="s1")
+        rt.on_pre_llm_call(session_id="s1", conversation_history=history, turn_id="t1")
+        self.assertEqual(len(rt._turn_tool_events.get("s1", [])), 1)
+        rt.on_pre_llm_call(session_id="s1", conversation_history=history, turn_id="t2")
+        self.assertEqual(len(rt._turn_tool_events.get("s1", [])), 0)
+
     def test_turn_events_capped(self):
         class MockCtx:
             pass
