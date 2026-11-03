@@ -8,6 +8,7 @@ without requiring an extra agent turn:
 - Git tag verification (git tag -l)
 - Git remote verification (git remote get-url)
 - File existence / non-empty checks (test -e)
+- Path / file absence / deletion checks (test ! -e)
 - Directory existence (test -d)
 - Environment variable presence (test -n "$VAR")
 - Service presence (launchctl list)
@@ -144,6 +145,42 @@ def probe_file_existence(path: str) -> ProbeResult:
         command=f"test -e {path}",
         output=f"exists={exists}",
     )
+
+
+def probe_file_absence(path: str) -> ProbeResult:
+    """Safely probe if a file or path has been deleted or does not exist."""
+    clean_path = os.path.expanduser(path.strip())
+    try:
+        try:
+            os.lstat(clean_path)
+            exists = True
+        except FileNotFoundError:
+            exists = False
+        except PermissionError as pe:
+            return ProbeResult(
+                executed=False,
+                success=False,
+                claim=f"path absent: {clean_path}",
+                command=f"test ! -e {clean_path}",
+                output=f"Probe inconclusive (permission denied): {pe}",
+            )
+        is_absent = not exists
+        out = "absent=True (path does not exist)" if is_absent else f"absent=False (path still exists: {clean_path})"
+        return ProbeResult(
+            executed=True,
+            success=is_absent,
+            claim=f"path absent: {clean_path}",
+            command=f"test ! -e {clean_path} && test ! -L {clean_path}",
+            output=out,
+        )
+    except Exception as e:
+        return ProbeResult(
+            executed=False,
+            success=False,
+            claim=f"path absent: {clean_path}",
+            command=f"test ! -e {clean_path} && test ! -L {clean_path}",
+            output=f"Probe inconclusive: {e}",
+        )
 
 
 def probe_directory_existence(path: str) -> ProbeResult:
@@ -717,7 +754,7 @@ def run_active_probes_for_draft(draft: str, cwd: str) -> list[ProbeResult]:
                 probes.append(res)
 
     # 4. Probe file existence if explicit file creation or existence is asserted with a path-like token
-    ext_pattern = r"(?:py|json|ya?ml|toml|md|txt|ts|js|sh|html|css|rs|go|log|lock|conf|cfg|ini|sql)"
+    ext_pattern = r"(?:py|json|ya?ml|toml|md|txt|ts|js|sh|html|css|rs|go|log|lock|conf|cfg|ini|sql|bak|disabled|plist)"
     post_verb_matches = re.findall(
         rf"(?i)(?<!not )(?<!never )(?<!n't )\b(?:created|written\s+to|written\s+into|saved|added)\s+(?:in|to|at)?\s*[`'\"]?([/~a-zA-Z0-9_\-./]+(?:\.{ext_pattern}))[`'\"]?",
         scan_draft,
@@ -843,5 +880,42 @@ def run_active_probes_for_draft(draft: str, cwd: str) -> list[ProbeResult]:
             seen_envs.add(v_clean)
             probes.append(probe_env_var(v_clean))
             env_count += 1
+
+    # 13. Probe path/file absence if deletion or removal is explicitly asserted (bounded by budget)
+    MAX_ABSENCE_PROBES = 5
+    absence_patterns = [
+        re.compile(
+            rf"(?i)(?<!not )(?<!never )(?<!n't )\b(?:deleted|removed|purged|cleaned\s+up|dropped)\s+(?:the\s+)?(?:temporary\s+)?(?:file|script|artifact|directory|folder)?\s*[`'\"]?([/~a-zA-Z0-9_\-./]+(?:\.{ext_pattern})(?![\w\-]|(?:\.[a-zA-Z0-9])))[`'\"]?"
+        ),
+        re.compile(
+            rf"(?i)(?<!not )(?<!never )(?<!n't )[`'\"]?([/~a-zA-Z0-9_\-./]+(?:\.{ext_pattern}))[`'\"]?\s+(?:was\s+|is\s+|has\s+been\s+)?(?:deleted|removed|purged|cleaned\s+up|dropped|gone)\b"
+        ),
+        re.compile(
+            rf"(?i)[`'\"]?([/~a-zA-Z0-9_\-./]+(?:\.{ext_pattern}))[`'\"]?\s+(?:does\s+not\s+exist|no\s+longer\s+exists)\b"
+        ),
+        re.compile(
+            r"(?i)(?<!not )(?<!never )(?<!n't )\b(?:deleted|removed|purged|cleaned\s+up)\s+(?:the\s+)?(?:directory|folder)\s+[`'\"]?([/~a-zA-Z0-9_\-./]+)[`'\"]?\b"
+        ),
+    ]
+    absence_count = 0
+    seen_absent_paths: set[str] = set()
+    for pat in absence_patterns:
+        if absence_count >= MAX_ABSENCE_PROBES:
+            break
+        for m in pat.finditer(scan_draft):
+            if absence_count >= MAX_ABSENCE_PROBES:
+                break
+            if _is_negated_claim(scan_draft, m.start()):
+                continue
+            cand = m.group(1).strip().rstrip('.,;:!?)\'"')
+            if not cand or os.path.basename(cand).lower() in ignored_basenames:
+                continue
+            expanded_path = os.path.expanduser(cand)
+            if not os.path.isabs(expanded_path):
+                expanded_path = os.path.abspath(os.path.join(cwd, expanded_path))
+            if expanded_path not in seen_absent_paths:
+                seen_absent_paths.add(expanded_path)
+                probes.append(probe_file_absence(expanded_path))
+                absence_count += 1
 
     return probes

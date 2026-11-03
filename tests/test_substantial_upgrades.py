@@ -15,6 +15,7 @@ try:
         probe_command_available,
         probe_directory_existence,
         probe_env_var,
+        probe_file_absence,
         probe_file_existence,
         probe_git_branch,
         probe_git_clean_status,
@@ -34,6 +35,7 @@ except ImportError:
         probe_command_available,
         probe_directory_existence,
         probe_env_var,
+        probe_file_absence,
         probe_file_existence,
         probe_git_branch,
         probe_git_clean_status,
@@ -499,6 +501,59 @@ class TestActiveProber(unittest.TestCase):
         res_missing = probe_file_existence("/tmp/non_existent_file_xyz_123.txt")
         self.assertTrue(res_missing.executed)
         self.assertFalse(res_missing.success)
+
+    def test_probe_file_absence(self):
+        # Non-existent file confirms absence
+        res_missing = probe_file_absence("/tmp/non_existent_deleted_file_xyz_123.py")
+        self.assertTrue(res_missing.executed)
+        self.assertTrue(res_missing.success)
+        self.assertIn("absent=True", res_missing.output)
+        self.assertEqual(res_missing.command, "test ! -e /tmp/non_existent_deleted_file_xyz_123.py && test ! -L /tmp/non_existent_deleted_file_xyz_123.py")
+
+        # Existing file contradicts absence
+        with tempfile.NamedTemporaryFile() as tmp:
+            res_exists = probe_file_absence(tmp.name)
+            self.assertTrue(res_exists.executed)
+            self.assertFalse(res_exists.success)
+            self.assertIn("absent=False", res_exists.output)
+
+        # Inaccessible path triggers inconclusive result
+        with mock.patch("os.lstat", side_effect=PermissionError("Permission denied")):
+            res_perm = probe_file_absence("/restricted/path/foo.py")
+            self.assertFalse(res_perm.executed)
+            self.assertFalse(res_perm.success)
+            self.assertIn("permission denied", res_perm.output.lower())
+
+    def test_run_active_probes_for_absence(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            # 1. Claim deleted temporary script where file does not exist
+            draft_absent = "I deleted the temporary script test_cleanup.py."
+            probes = run_active_probes_for_draft(draft_absent, tmp_dir)
+            absent_probe = next((p for p in probes if "path absent" in p.claim), None)
+            self.assertIsNotNone(absent_probe)
+            assert absent_probe is not None
+            self.assertTrue(absent_probe.success)
+
+            # 2. Claim removed file where file still exists (contradicted)
+            still_exists = os.path.join(tmp_dir, "still_here.json")
+            with open(still_exists, "w") as f:
+                f.write("{}")
+            draft_contra = f"The artifact {still_exists} was removed."
+            probes_contra = run_active_probes_for_draft(draft_contra, tmp_dir)
+            contra_probe = next((p for p in probes_contra if still_exists in p.claim), None)
+            self.assertIsNotNone(contra_probe)
+            assert contra_probe is not None
+            self.assertFalse(contra_probe.success)
+
+            # 3. Negated deletion claim should not trigger absence probe
+            draft_neg = "I did not delete keep_file.py."
+            probes_neg = run_active_probes_for_draft(draft_neg, tmp_dir)
+            self.assertFalse(any("keep_file.py" in p.claim for p in probes_neg))
+
+            # 4. Partial extension match such as .pyc should not trigger .py absence probe
+            draft_pyc = "I deleted cache.pyc from the repository."
+            probes_pyc = run_active_probes_for_draft(draft_pyc, tmp_dir)
+            self.assertFalse(any("cache.py" in p.claim for p in probes_pyc))
 
     def test_probe_git_clean_status(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
