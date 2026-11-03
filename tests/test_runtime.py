@@ -298,6 +298,27 @@ class TestAdvisorRuntime(unittest.TestCase):
         self.assertIn("Advisor redraft guidance", context)
         self.assertIn("no deploy tool ran", context)
 
+    def test_user_key_normalizes_multimodal_content(self):
+        self.assertEqual(
+            runtime_mod._user_key([{"type": "text", "text": "do   the thing"}]),
+            runtime_mod._user_key("do the thing"),
+        )
+        self.assertEqual(runtime_mod._user_key(None), runtime_mod._user_key(""))
+
+    def test_rejection_guidance_kept_when_request_unknown(self):
+        class MockCtx:
+            class MockLLM:
+                def complete(self, **kwargs):
+                    raise AssertionError("no LLM call expected")
+
+            llm = MockLLM()
+
+        rt = runtime_mod.AdvisorRuntime(MockCtx())
+        rt.state.enabled = True
+        rt._record_rejection("s", {"reason": "unbacked claim"}, runtime_mod._user_key("do the thing"))
+        res = rt.on_pre_llm_call(session_id="s")
+        self.assertIn("Advisor redraft guidance", res["context"])
+
     def test_rejection_guidance_cleared_on_new_request(self):
         class MockCtx:
             class MockLLM:

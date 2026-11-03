@@ -229,9 +229,17 @@ def _get_git_diff(cwd: str, paths: list[str], max_chars: int = 12000) -> str | N
         return None
 
 
-def _user_key(text: str) -> str:
+def _user_key(text) -> str:
     """Stable short key for the user request a rejection belongs to."""
-    return hashlib.sha1((text or "").strip().encode("utf-8", "ignore")).hexdigest()[:12]
+    if isinstance(text, list):
+        text = " ".join(
+            str(block.get("text") or "") if isinstance(block, dict) else str(block)
+            for block in text
+        )
+    elif isinstance(text, dict):
+        text = str(text.get("text") or "")
+    normalized = " ".join(str(text or "").split())
+    return hashlib.sha1(normalized.encode("utf-8", "ignore")).hexdigest()[:12]
 
 
 def _clip_directive(text: str, cap: int) -> str:
@@ -747,7 +755,7 @@ class AdvisorRuntime:
             if history:
                 self._session_history[sess] = list(history[-20:])
             pending = self._rejections.get(sess)
-            if pending and pending.get("user_key") != _user_key(last_user):
+            if pending and last_user and pending.get("user_key") != _user_key(last_user):
                 self._rejections.pop(sess, None)
                 pending = None
 
@@ -871,7 +879,7 @@ class AdvisorRuntime:
             system_prompt += (
                 f"\n\nREDRAFT ESCALATION: this response has already been rejected {rejections} times. "
                 "Approve it when its material claims are corroborated and it answers the user's request. "
-                "Reject only for a claim contradicted by tool output, a fabricated result, or a missed user instruction — "
+                "Reject for a claim contradicted by tool output, a fabricated result, an uncorroborated material claim, or a missed user instruction — "
                 "not for precision, phrasing, or missing detail."
             )
 
