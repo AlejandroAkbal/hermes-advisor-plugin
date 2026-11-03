@@ -70,6 +70,43 @@ class TestGatewayLive(unittest.TestCase):
         self.assertEqual(rc, 4)
         self.assertEqual(signals, [])
 
+    def test_restart_worker_refuses_launchd_wrapper(self):
+        """Signalling the osascript wrapper kills it and launchd then SIGTERMs the gateway."""
+        signals = []
+        with mock.patch.object(gl, "gateway_pid", lambda: 111), \
+             mock.patch.object(gl, "_is_wrapper", lambda _pid: True), \
+             mock.patch.object(gl.os, "kill", lambda pid, sig: signals.append(pid)), \
+             mock.patch.object(gl, "_log", lambda _msg: None):
+            rc = gl._restart_worker(Path("."), 0)
+        self.assertEqual(rc, 5)
+        self.assertEqual(signals, [])
+
+    def test_gateway_pid_prefers_live_pidfile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pidfile = Path(tmp) / "gateway.pid"
+            pidfile.write_text('{"pid": %d, "kind": "hermes-gateway"}' % os.getpid())
+            with mock.patch.object(gl, "GATEWAY_PID_PATH", pidfile), \
+                 mock.patch.object(gl, "_is_wrapper", lambda _pid: False):
+                self.assertEqual(gl.gateway_pid(), os.getpid())
+
+    def test_gateway_pid_ignores_stale_pidfile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pidfile = Path(tmp) / "gateway.pid"
+            pidfile.write_text('{"pid": 999999, "kind": "hermes-gateway"}')
+            status = mock.Mock(stdout="✓ Gateway is supervised by launchd (PID 111)")
+            with mock.patch.object(gl, "GATEWAY_PID_PATH", pidfile), \
+                 mock.patch.object(gl.subprocess, "run", lambda *a, **k: status), \
+                 mock.patch.object(gl, "_is_wrapper", lambda _pid: False):
+                self.assertEqual(gl.gateway_pid(), 111)
+
+    def test_gateway_pid_resolves_wrapper_to_child(self):
+        status = mock.Mock(stdout="✓ Gateway is supervised by launchd (PID 111)")
+        with mock.patch.object(gl, "GATEWAY_PID_PATH", Path("/nonexistent/gateway.pid")), \
+             mock.patch.object(gl.subprocess, "run", lambda *a, **k: status), \
+             mock.patch.object(gl, "_is_wrapper", lambda pid: pid == 111), \
+             mock.patch.object(gl, "_child_gateway_pid", lambda parent: 222):
+            self.assertEqual(gl.gateway_pid(), 222)
+
 
 if __name__ == "__main__":
     unittest.main()
