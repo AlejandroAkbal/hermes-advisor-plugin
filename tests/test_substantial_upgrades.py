@@ -788,6 +788,21 @@ class TestActiveProber(unittest.TestCase):
             self.assertFalse(any("-a" in c for c in opt_claims))
             self.assertFalse(any("release" in c for c in opt_claims))
 
+            # Combined options such as -am also capture the tag name rather than message
+            combined_draft = 'Ran git tag -am "release v2" v2.0.0 for release.'
+            comb_probes = run_active_probes_for_draft(combined_draft, tmp_dir)
+            comb_claims = [p.claim for p in comb_probes]
+            self.assertTrue(any("tag v2.0.0 exists" in c for c in comb_claims))
+            self.assertFalse(any("-am" in c for c in comb_claims))
+            self.assertFalse(any("release" in c for c in comb_claims))
+
+            # Tag deletion commands (e.g. -d, --delete) do not trigger existence probes
+            del_draft = "Deleted obsolete tag: git tag -d v0.9.0 and git tag --delete v0.8.0."
+            del_probes = run_active_probes_for_draft(del_draft, tmp_dir)
+            del_claims = [p.claim for p in del_probes]
+            self.assertFalse(any("v0.9.0" in c for c in del_claims))
+            self.assertFalse(any("v0.8.0" in c for c in del_claims))
+
             # Tag names with build metadata (+) are fully matched
             subprocess.run(["git", "tag", "v2.0.0+build.1"], cwd=tmp_dir, check=True, capture_output=True)
             plus_draft = "The release is tagged as v2.0.0+build.1."

@@ -464,13 +464,17 @@ def _extract_command_names(draft: str) -> list[str]:
 
 
 def _extract_tag_names(draft: str) -> list[str]:
-    """Safely extract claimed git tag names from draft, handling options and messages."""
+    """Safely extract claimed git tag names from draft, handling options, combined flags, and message arguments."""
     pattern = re.compile(
-        r'(?i)\b(?:git\s+tag(?:\s+(?:-(?:m|F)\s+(?:"[^"]*"|\'[^\']*\'|\S+)|-[a-zA-Z0-9]+))*|tagged(?:\s+as)?)\s+[`\'"]?([a-zA-Z0-9_\-\.\/\+]+)[`\'"]?'
+        r'(?i)\b(?:git\s+tag(?:\s+(?:-(?:[a-zA-Z0-9]*[mF])\s+(?:"[^"]*"|\'[^\']*\'|\S+)|-[a-ce-ln-z0-9]+))*|tagged(?:\s+as)?)\s+[`\'"]?([a-zA-Z0-9_\-\.\/\+]+)[`\'"]?'
     )
     tags: list[str] = []
     for m in pattern.finditer(draft):
         if _is_negated_claim(draft, m.start()):
+            continue
+        # Exclude deletion invocations such as git tag -d v1.0 or git tag --delete v1.0
+        match_prefix = draft[max(0, m.start() - 10):m.end()]
+        if re.search(r"(?i)\bgit\s+tag\s+-(?:d|-delete)\b", match_prefix):
             continue
         candidate = m.group(1).strip().rstrip(".,;:!?)'\"")
         if candidate.startswith("-") or candidate.lower() in {"the", "a", "an", "new", "latest", "as"}:
