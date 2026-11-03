@@ -151,7 +151,19 @@ def probe_file_absence(path: str) -> ProbeResult:
     """Safely probe if a file or path has been deleted or does not exist."""
     clean_path = os.path.expanduser(path.strip())
     try:
-        exists = os.path.exists(clean_path)
+        try:
+            os.lstat(clean_path)
+            exists = True
+        except FileNotFoundError:
+            exists = False
+        except PermissionError as pe:
+            return ProbeResult(
+                executed=False,
+                success=False,
+                claim=f"path absent: {clean_path}",
+                command=f"test ! -e {clean_path}",
+                output=f"Probe inconclusive (permission denied): {pe}",
+            )
         is_absent = not exists
         out = "absent=True (path does not exist)" if is_absent else f"absent=False (path still exists: {clean_path})"
         return ProbeResult(
@@ -873,7 +885,7 @@ def run_active_probes_for_draft(draft: str, cwd: str) -> list[ProbeResult]:
     MAX_ABSENCE_PROBES = 5
     absence_patterns = [
         re.compile(
-            rf"(?i)(?<!not )(?<!never )(?<!n't )\b(?:deleted|removed|purged|cleaned\s+up|dropped)\s+(?:the\s+)?(?:temporary\s+)?(?:file|script|artifact|directory|folder)?\s*[`'\"]?([/~a-zA-Z0-9_\-./]+(?:\.{ext_pattern}))[`'\"]?"
+            rf"(?i)(?<!not )(?<!never )(?<!n't )\b(?:deleted|removed|purged|cleaned\s+up|dropped)\s+(?:the\s+)?(?:temporary\s+)?(?:file|script|artifact|directory|folder)?\s*[`'\"]?([/~a-zA-Z0-9_\-./]+(?:\.{ext_pattern})(?![\w\-]))[`'\"]?"
         ),
         re.compile(
             rf"(?i)(?<!not )(?<!never )(?<!n't )[`'\"]?([/~a-zA-Z0-9_\-./]+(?:\.{ext_pattern}))[`'\"]?\s+(?:was\s+|is\s+|has\s+been\s+)?(?:deleted|removed|purged|cleaned\s+up|dropped|gone)\b"
