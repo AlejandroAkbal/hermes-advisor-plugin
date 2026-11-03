@@ -106,6 +106,46 @@ class TestAdvisorRuntime(unittest.TestCase):
         self.assertIn("... [truncated] ...", resp_text)
         self.assertLess(len(resp_text), len(long_text))
 
+    def test_clip_result_keeps_both_ends(self):
+        _clip_result = runtime_mod._clip_result
+        long_text = "HEADER_" + ("M" * 20000) + "_FOOTER"
+        clipped = _clip_result(long_text, 6000)
+        self.assertTrue(clipped.startswith("HEADER_"))
+        self.assertTrue(clipped.endswith("_FOOTER"))
+        self.assertIn("[truncated", clipped)
+        self.assertLessEqual(len(clipped), 6000 + 60)
+        self.assertEqual(_clip_result("short", 6000), "short")
+
+    def test_format_audit_events_spends_budget_on_newest(self):
+        _format_audit_events = runtime_mod._format_audit_events
+        events = [
+            {"tool": "terminal", "args": f"cmd{i}", "result": f"OLD{i}_" + ("x" * 20000) + "_TAIL"}
+            for i in range(20)
+        ]
+        rendered = _format_audit_events(events)
+        text = "\n\n".join(rendered)
+
+        # Newest event keeps its tail; oldest is a stub that still appears.
+        self.assertIn("_TAIL", rendered[-1])
+        self.assertIn("OLD19_", rendered[-1])
+        self.assertIn("1. Tool: terminal", rendered[0])
+        self.assertLess(len(rendered[0]), 1000)
+        # Chronological numbering survives the reverse pass.
+        self.assertIn("20. Tool: terminal", rendered[-1])
+        self.assertLessEqual(len(text), runtime_mod.AUDIT_EVENT_BUDGET_CHARS + 500)
+
+    def test_format_audit_events_marks_omitted_events(self):
+        _format_audit_events = runtime_mod._format_audit_events
+        events = [
+            {"tool": "terminal", "args": "x", "result": "y" * 4000} for _ in range(40)
+        ]
+        rendered = _format_audit_events(events)
+        self.assertIn("earlier events omitted", rendered[0])
+        self.assertLess(len(rendered), len(events))
+        self.assertLessEqual(
+            len("\n\n".join(rendered)), runtime_mod.AUDIT_EVENT_BUDGET_CHARS + 500
+        )
+
     def test_format_history_scopes_tool_calls_to_current_turn(self):
         _format_history = runtime_mod.AdvisorRuntime._format_history
         history = [
