@@ -634,7 +634,7 @@ class AdvisorRuntime:
         self, *, tool_name: str = "", args: dict | None = None, result: Any = None, session_id: str = "", **kwargs
     ) -> None:
         """Record tool execution for the active turn in a thread-safe buffer."""
-        if tool_name in ("verify_turn", "consult_advisor", "tool_search", "tool_describe"):
+        if tool_name in ("verify_turn", "tool_search", "tool_describe"):
             return
         sess = session_id or "default"
         with self._state_lock:

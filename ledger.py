@@ -161,7 +161,7 @@ def _pr_view_indicates_merged(res_str: str) -> bool:
 
 def _extract_merged_pr_number(args_str: str, res_str: str) -> str | None:
     """Extract actual merged PR number from gh pr merge/view command arguments or URL."""
-    arg_m = re.search(r"\bgh\s+pr\s+(?:merge|view)\s+(?:--[a-z0-9_-]+(?:\s+[^\s]+)?\s+)*#?(\d+)\b", args_str)
+    arg_m = re.search(r"\bgh\s+pr\s+(?:merge|view)\b.*?(?:^|\s)(?:[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)?#?(\d+)\b", args_str)
     if arg_m:
         return arg_m.group(1)
     arg_url_m = re.search(r"\bgh\s+pr\s+(?:merge|view)\s+.*?https?://github\.com/[^/\s]+/[^/\s]+/pull/(\d+)", args_str)
@@ -179,9 +179,12 @@ def _extract_merged_pr_number(args_str: str, res_str: str) -> str | None:
         url_m = re.search(r"https?://github\.com/[^/\s]+/[^/\s]+/pull/(\d+)", res_str)
         if url_m:
             return url_m.group(1)
-        res_m = re.search(r"(?i)\b(?:merged\s+)?(?:pr|pull request)\s+#?(\d+)\b", res_str)
+        res_m = re.search(r"(?i)\b(?:merged\s+)?(?:pull request|pr)\s+(?:[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)?#?(\d+)\b", res_str)
         if res_m:
             return res_m.group(1)
+        num_m = re.search(r"(?<!\w)#(\d+)\b", res_str)
+        if num_m:
+            return num_m.group(1)
     return None
 
 

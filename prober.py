@@ -6,7 +6,10 @@ without requiring an extra agent turn:
 - Current git branch (git branch --show-current)
 - Git commit verification (git log -1)
 - Git tag verification (git tag -l)
+- Git remote verification (git remote get-url)
 - File existence / non-empty checks (test -e)
+- Directory existence (test -d)
+- Environment variable presence (test -n "$VAR")
 - Service presence (launchctl list)
 - Process PID presence & zombie rejection (ps -p)
 - TCP port listening state (lsof -iTCP -sTCP:LISTEN)
@@ -141,6 +144,28 @@ def probe_file_existence(path: str) -> ProbeResult:
         command=f"test -e {path}",
         output=f"exists={exists}",
     )
+
+
+def probe_directory_existence(path: str) -> ProbeResult:
+    """Safely probe if a directory exists on disk."""
+    clean_path = os.path.expanduser(path.strip())
+    try:
+        is_dir = os.path.isdir(clean_path)
+        return ProbeResult(
+            executed=True,
+            success=is_dir,
+            claim=f"directory exists: {clean_path}",
+            command=f"test -d {clean_path}",
+            output=f"isdir={is_dir}",
+        )
+    except Exception as e:
+        return ProbeResult(
+            executed=False,
+            success=False,
+            claim=f"directory exists: {clean_path}",
+            command=f"test -d {clean_path}",
+            output=f"Probe inconclusive: {e}",
+        )
 
 
 def probe_service_running(label: str) -> ProbeResult | None:
@@ -406,6 +431,60 @@ def probe_git_tag(tag_name: str, cwd: str) -> ProbeResult | None:
         )
 
 
+def probe_git_remote(remote_name: str, cwd: str) -> ProbeResult | None:
+    """Safely probe if a git remote is configured and retrieve its URL."""
+    if not _is_git_work_tree(cwd):
+        return None
+    clean_remote = remote_name.strip()
+    if (
+        not re.fullmatch(r"[a-zA-Z0-9_\-\.]+", clean_remote)
+        or len(clean_remote) > 64
+        or clean_remote.startswith("-")
+    ):
+        return None
+    try:
+        proc = subprocess.run(
+            ["git", "--no-optional-locks", "-C", cwd, "remote", "get-url", clean_remote],
+            capture_output=True,
+            text=True,
+            timeout=PROBE_TIMEOUT_SECONDS,
+            check=False,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            url = proc.stdout.strip()
+            return ProbeResult(
+                executed=True,
+                success=True,
+                claim=f"git remote {clean_remote} exists",
+                command=f"git -C {cwd} remote get-url {clean_remote}",
+                output=url,
+            )
+        stderr = proc.stderr.strip().lower()
+        if proc.returncode != 0 and ("no such remote" in stderr or not stderr):
+            return ProbeResult(
+                executed=True,
+                success=False,
+                claim=f"git remote {clean_remote} exists",
+                command=f"git -C {cwd} remote get-url {clean_remote}",
+                output=f"remote {clean_remote} not found",
+            )
+        return ProbeResult(
+            executed=False,
+            success=False,
+            claim=f"git remote {clean_remote} exists",
+            command=f"git -C {cwd} remote get-url {clean_remote}",
+            output=f"Probe inconclusive: git exit code {proc.returncode} {proc.stderr.strip()}".strip(),
+        )
+    except Exception as e:
+        return ProbeResult(
+            executed=False,
+            success=False,
+            claim=f"git remote {clean_remote} exists",
+            command=f"git -C {cwd} remote get-url {clean_remote}",
+            output=f"Probe inconclusive: {e}",
+        )
+
+
 def probe_command_available(command_name: str) -> ProbeResult:
     """Safely probe if an executable binary or CLI command is installed and available in PATH."""
     clean_name = command_name.strip()
@@ -432,6 +511,27 @@ def probe_command_available(command_name: str) -> ProbeResult:
         claim=f"command {clean_name} available",
         command=f"which {clean_name}",
         output=f"{clean_name} not found in PATH",
+    )
+
+
+def probe_env_var(var_name: str) -> ProbeResult:
+    """Safely probe if an environment variable is set."""
+    clean_name = var_name.strip().lstrip("$")
+    if not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", clean_name) or len(clean_name) > 128:
+        return ProbeResult(
+            executed=False,
+            success=False,
+            claim=f"environment variable {var_name} is set",
+            command=f"test -n \"${var_name}\"",
+            output=f"Invalid environment variable name: {var_name}",
+        )
+    is_set = clean_name in os.environ
+    return ProbeResult(
+        executed=True,
+        success=is_set,
+        claim=f"environment variable {clean_name} is set",
+        command=f"test -n \"${clean_name}\"",
+        output=f"{clean_name} is set" if is_set else f"{clean_name} is not set",
     )
 
 
@@ -481,6 +581,68 @@ def _extract_tag_names(draft: str) -> list[str]:
             continue
         tags.append(candidate)
     return tags
+
+
+def _extract_directory_paths(draft: str, cwd: str) -> list[str]:
+    """Safely extract claimed directory/folder paths from draft, filtering negations."""
+    patterns = [
+        re.compile(r"(?i)\b(?:directory|folder)\s+[`'\"]?([/~a-zA-Z0-9_\-./]+)[`'\"]?\s+(?:exists?|created|is present|was created)\b"),
+        re.compile(r"(?i)\b(?:created|made)\s+(?:directory|folder)\s+[`'\"]?([/~a-zA-Z0-9_\-./]+)[`'\"]?\b"),
+        re.compile(r"(?i)\b(?:in|into|under)\s+(?:directory|folder)\s+[`'\"]?([/~a-zA-Z0-9_\-./]+)[`'\"]?\b"),
+    ]
+    ignored = {"the", "a", "an", "this", "that", "our", "new", "all", "each", "and", "or", "to", "is", "for", "with"}
+    paths: list[str] = []
+    for pat in patterns:
+        for m in pat.finditer(draft):
+            if _is_negated_claim(draft, m.start()):
+                continue
+            cand = m.group(1).strip().rstrip(".,;:!?)'\"")
+            if not cand or cand.lower() in ignored:
+                continue
+            if "/" in cand or cand.startswith("~") or cand.startswith("."):
+                expanded = os.path.expanduser(cand)
+                if not os.path.isabs(expanded):
+                    expanded = os.path.abspath(os.path.join(cwd, expanded))
+                paths.append(expanded)
+    return paths
+
+
+def _extract_git_remotes(draft: str) -> list[str]:
+    """Safely extract claimed git remote names from draft, filtering negations."""
+    patterns = [
+        re.compile(r"(?i)\b(?:git\s+remote|remote)\s+[`'\"]?([a-zA-Z0-9_\-\.]+)[`'\"]?\s+(?:exists?|is\s+set|configured|points\s+to)\b"),
+        re.compile(r"(?i)\b(?:configured|set|added)\s+(?:git\s+)?remote\s+[`'\"]?([a-zA-Z0-9_\-\.]+)[`'\"]?\b"),
+    ]
+    ignored_remotes = {"the", "a", "an", "this", "that", "our", "new", "all", "each", "and", "or", "not", "no", "to", "is", "for", "with", "branch", "commit", "tag"}
+    remotes: list[str] = []
+    for pat in patterns:
+        for m in pat.finditer(draft):
+            if _is_negated_claim(draft, m.start()):
+                continue
+            cand = m.group(1).strip().rstrip(".,;:!?)'\"")
+            if not cand or cand.startswith("-") or cand.lower() in ignored_remotes:
+                continue
+            remotes.append(cand)
+    return remotes
+
+
+def _extract_env_vars(draft: str) -> list[str]:
+    """Safely extract claimed environment variable names from draft, filtering negations."""
+    patterns = [
+        re.compile(r"(?i)\b(?:environment\s+variable|env\s+var)\s+[`'\"]?\$?([a-zA-Z_][a-zA-Z0-9_]*)[`'\"]?\s+(?:is\s+)?(?:set|exported|present|defined)\b"),
+        re.compile(r"(?i)\b[`'\"]?\$([A-Z_][A-Z0-9_]{1,64})[`'\"]?\s+(?:is\s+)?(?:set|exported|defined|configured)\b"),
+    ]
+    ignored_vars = {"THE", "A", "AN", "THIS", "THAT", "AND", "OR", "NOT", "NO", "TO", "IS", "FOR", "WITH", "TRUE", "FALSE", "NULL"}
+    vars_list: list[str] = []
+    for pat in patterns:
+        for m in pat.finditer(draft):
+            if _is_negated_claim(draft, m.start()):
+                continue
+            cand = m.group(1).strip()
+            if not cand or cand.upper() in ignored_vars or len(cand) > 128:
+                continue
+            vars_list.append(cand)
+    return vars_list
 
 
 def run_active_probes_for_draft(draft: str, cwd: str) -> list[ProbeResult]:
@@ -625,5 +787,45 @@ def run_active_probes_for_draft(draft: str, cwd: str) -> list[ProbeResult]:
             if res:
                 probes.append(res)
                 tag_count += 1
+
+    # 10. Probe directory existence if asserted (bounded by budget)
+    MAX_DIR_PROBES = 5
+    dir_count = 0
+    seen_dirs: set[str] = set()
+    for d_path in _extract_directory_paths(scan_draft, cwd):
+        if dir_count >= MAX_DIR_PROBES:
+            break
+        if d_path not in seen_dirs:
+            seen_dirs.add(d_path)
+            probes.append(probe_directory_existence(d_path))
+            dir_count += 1
+
+    # 11. Probe git remote if asserted (bounded by budget)
+    MAX_REMOTE_PROBES = 5
+    remote_count = 0
+    seen_remotes: set[str] = set()
+    for r_name in _extract_git_remotes(scan_draft):
+        if remote_count >= MAX_REMOTE_PROBES:
+            break
+        r_clean = r_name.lower()
+        if r_clean not in seen_remotes:
+            seen_remotes.add(r_clean)
+            res = probe_git_remote(r_name, cwd)
+            if res:
+                probes.append(res)
+                remote_count += 1
+
+    # 12. Probe environment variables if asserted (bounded by budget)
+    MAX_ENV_PROBES = 5
+    env_count = 0
+    seen_envs: set[str] = set()
+    for v_name in _extract_env_vars(scan_draft):
+        if env_count >= MAX_ENV_PROBES:
+            break
+        v_clean = v_name.strip()
+        if v_clean not in seen_envs:
+            seen_envs.add(v_clean)
+            probes.append(probe_env_var(v_clean))
+            env_count += 1
 
     return probes
