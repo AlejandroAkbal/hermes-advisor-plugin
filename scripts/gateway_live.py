@@ -12,6 +12,7 @@ Exit codes: 0 live, 3 stale, 4 cannot determine, 5 restart failed.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import signal
@@ -23,6 +24,7 @@ from pathlib import Path
 
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 LOG_PATH = Path.home() / ".hermes" / "advisor" / "gateway_live.log"
+GATEWAY_PID_PATH = Path.home() / ".hermes" / "gateway.pid"
 STATUS_PID_RE = re.compile(r"PID (\d+)")
 # How long we allow the gateway to finish its in-flight turn and respawn before
 # declaring the restart failed. The drain itself is not launchd-bounded: in-band
@@ -72,14 +74,65 @@ def classify(pid_start: float | None, commit: float | None) -> str:
     return "live" if pid_start >= commit else "stale"
 
 
+def _command_of(pid: int) -> str:
+    try:
+        return subprocess.run(
+            ["ps", "-o", "command=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def _is_wrapper(pid: int) -> bool:
+    """True when *pid* is the launchd osascript wrapper rather than the gateway."""
+    return "osascript" in _command_of(pid)
+
+
+def _child_gateway_pid(parent: int) -> int | None:
+    """First python child of *parent*: the wrapper's real gateway process."""
+    try:
+        out = subprocess.run(
+            ["ps", "-Ao", "pid=,ppid=,command="], capture_output=True, text=True, timeout=15,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3 or parts[1] != str(parent):
+            continue
+        pid, command = int(parts[0]), parts[2]
+        if "python" in command and "osascript" not in command:
+            return pid
+    return None
+
+
 def gateway_pid() -> int | None:
+    """PID of the gateway process itself, never the launchd osascript wrapper.
+
+    Sending SIGUSR1 to the wrapper kills the wrapper; launchd then SIGTERMs the
+    real gateway, which skips the drain and interrupts every active turn
+    (observed: "Gateway drain timed out after 0.0s with 4 active agent(s)").
+    `~/.hermes/gateway.pid` names the process that actually handles the signal;
+    fall back to the status banner, resolving down from the wrapper when needed.
+    """
+    try:
+        record = json.loads(GATEWAY_PID_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        record = {}
+    pid = record.get("pid")
+    if isinstance(pid, int) and record.get("kind") == "hermes-gateway" and process_start_epoch(pid) is not None and not _is_wrapper(pid):
+        return pid
     try:
         out = subprocess.run(
             ["hermes", "gateway", "status"], capture_output=True, text=True, timeout=30,
         ).stdout
     except (OSError, subprocess.SubprocessError):
         return None
-    return parse_status_pid(out)
+    pid = parse_status_pid(out)
+    if pid is None:
+        return None
+    return _child_gateway_pid(pid) if _is_wrapper(pid) else pid
 
 
 def check(repo: Path) -> int:
@@ -113,6 +166,9 @@ def _restart_worker(repo: Path, wait_seconds: int, signal_only: bool = False) ->
     if pid is None:
         _log("no gateway pid; nothing to signal")
         return 4
+    if _is_wrapper(pid):
+        _log(f"refusing to signal launchd wrapper pid {pid}: killing it makes launchd SIGTERM the gateway and skip the drain")
+        return 5
     try:
         os.kill(pid, signal.SIGUSR1)
     except OSError as exc:
