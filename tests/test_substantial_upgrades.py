@@ -773,6 +773,26 @@ class TestActiveProber(unittest.TestCase):
             tag_probe = next(p for p in probes if "tag v2.0.0 exists" in p.claim)
             self.assertTrue(tag_probe.success)
 
+            # Negated assertions should not trigger affirmative probes
+            negated_draft = "I have not installed fake_cli CLI, and the release is not tagged as v9.9.9."
+            neg_probes = run_active_probes_for_draft(negated_draft, tmp_dir)
+            neg_claims = [p.claim for p in neg_probes]
+            self.assertFalse(any("fake_cli" in c for c in neg_claims))
+            self.assertFalse(any("v9.9.9" in c for c in neg_claims))
+
+            # Git tag with option flags such as -a or -m captures the tag name rather than the flag
+            opt_draft = "Ran git tag -a v2.0.0 for release."
+            opt_probes = run_active_probes_for_draft(opt_draft, tmp_dir)
+            opt_claims = [p.claim for p in opt_probes]
+            self.assertTrue(any("tag v2.0.0 exists" in c for c in opt_claims))
+            self.assertFalse(any("-a" in c for c in opt_claims))
+
+            # Tag probe budget bounds execution to at most MAX_TAG_PROBES
+            many_tags = " ".join(f"tagged as v1.0.{i}" for i in range(20))
+            budget_probes = run_active_probes_for_draft(many_tags, tmp_dir)
+            tag_probe_count = sum(1 for p in budget_probes if "tag" in p.claim)
+            self.assertLessEqual(tag_probe_count, 5)
+
 
 class TestDialecticAuditor(unittest.TestCase):
     def test_arbiter_dismisses_pedantic_stylistic_accusations(self):

@@ -364,7 +364,11 @@ def probe_git_tag(tag_name: str, cwd: str) -> ProbeResult | None:
     if not _is_git_work_tree(cwd):
         return None
     clean_tag = tag_name.strip()
-    if not re.fullmatch(r"[a-zA-Z0-9_\-\.\/]+", clean_tag) or len(clean_tag) > 100:
+    if (
+        not re.fullmatch(r"[a-zA-Z0-9_\-\.\/]+", clean_tag)
+        or len(clean_tag) > 100
+        or clean_tag.startswith("-")
+    ):
         return None
     try:
         proc = subprocess.run(
@@ -547,17 +551,17 @@ def run_active_probes_for_draft(draft: str, cwd: str) -> list[ProbeResult]:
             if res:
                 probes.append(res)
 
-    # 8. Probe command/CLI availability if asserted
+    # 8. Probe command/CLI availability if asserted (ignoring negated assertions)
     cmd_matches = re.findall(
-        r"(?i)\b(?:CLI|binary|command|tool|executable)\s+[`'\"]?([a-zA-Z0-9_\-]+)[`'\"]?\s+(?:is\s+)?(?:installed|available|present)\b",
+        r"(?i)(?<!not )(?<!never )(?<!n't )\b(?:CLI|binary|command|tool|executable)\s+[`'\"]?([a-zA-Z0-9_\-]+)[`'\"]?\s+(?:is\s+)?(?:installed|available|present)\b",
         scan_draft,
     )
     cmd_matches += re.findall(
-        r"(?i)\b[`'\"]?([a-zA-Z0-9_\-]+)[`'\"]?\s+(?:CLI|binary|tool)\s+(?:is\s+)?(?:installed|available|present)\b",
+        r"(?i)(?<!not )(?<!never )(?<!n't )\b[`'\"]?([a-zA-Z0-9_\-]+)[`'\"]?\s+(?:CLI|binary|tool)\s+(?:is\s+)?(?:installed|available|present)\b",
         scan_draft,
     )
     cmd_matches += re.findall(
-        r"(?i)\binstalled\s+[`'\"]?([a-zA-Z0-9_\-]+)[`'\"]?\s+(?:CLI|binary|tool)\b",
+        r"(?i)(?<!not )(?<!never )(?<!n't )\binstalled\s+[`'\"]?([a-zA-Z0-9_\-]+)[`'\"]?\s+(?:CLI|binary|tool)\b",
         scan_draft,
     )
     ignored_cmds = {
@@ -565,24 +569,38 @@ def run_active_probes_for_draft(draft: str, cwd: str) -> list[ProbeResult]:
         "not", "no", "to", "is", "for", "with", "any", "some", "it", "its", "which", "what"
     }
     seen_cmds: set[str] = set()
+    MAX_CMD_PROBES = 5
+    cmd_count = 0
     for c_raw in cmd_matches:
+        if cmd_count >= MAX_CMD_PROBES:
+            break
         c_lower = c_raw.lower()
         if c_lower not in ignored_cmds and c_lower not in seen_cmds:
             seen_cmds.add(c_lower)
             probes.append(probe_command_available(c_raw))
+            cmd_count += 1
 
-    # 9. Probe git tag if asserted
+    # 9. Probe git tag if asserted (ignoring negated assertions, git options, and bounded by budget)
     tag_matches = re.findall(
-        r"(?i)\b(?:git\s+tag|tagged(?:\s+as)?)\s+[`'\"]?([a-zA-Z0-9_\-\.\/]+)[`'\"]?\b",
+        r"(?i)(?<!not )(?<!never )(?<!n't )\b(?:git\s+tag(?:\s+-[a-zA-Z0-9]+)*|tagged(?:\s+as)?)\s+[`'\"]?([a-zA-Z0-9_\-\.\/]+)[`'\"]?\b",
         scan_draft,
     )
     seen_tags: set[str] = set()
+    MAX_TAG_PROBES = 5
+    tag_count = 0
     for t_raw in tag_matches:
+        if tag_count >= MAX_TAG_PROBES:
+            break
         t_clean = t_raw.strip()
-        if t_clean.lower() not in {"the", "a", "an", "new", "latest"} and t_clean not in seen_tags:
+        if (
+            not t_clean.startswith("-")
+            and t_clean.lower() not in {"the", "a", "an", "new", "latest"}
+            and t_clean not in seen_tags
+        ):
             seen_tags.add(t_clean)
             res = probe_git_tag(t_clean, cwd)
             if res:
                 probes.append(res)
+                tag_count += 1
 
     return probes
