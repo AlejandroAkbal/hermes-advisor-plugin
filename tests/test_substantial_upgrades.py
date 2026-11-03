@@ -7,27 +7,32 @@ import subprocess
 import tempfile
 import unittest
 from unittest import mock
+
 try:
-    from hermes_plugins.advisor.dialectic import DialecticAuditor, parse_json_safely
+    from hermes_plugins.advisor.dialectic import DialecticAuditor
     from hermes_plugins.advisor.ledger import audit_draft_ledger
     from hermes_plugins.advisor.prober import (
+        probe_command_available,
         probe_file_existence,
         probe_git_branch,
         probe_git_clean_status,
         probe_git_commit,
+        probe_git_tag,
         probe_port_listening,
         probe_process_running,
         probe_service_running,
         run_active_probes_for_draft,
     )
 except ImportError:
-    from advisor.dialectic import DialecticAuditor, parse_json_safely
+    from advisor.dialectic import DialecticAuditor
     from advisor.ledger import audit_draft_ledger
     from advisor.prober import (
+        probe_command_available,
         probe_file_existence,
         probe_git_branch,
         probe_git_clean_status,
         probe_git_commit,
+        probe_git_tag,
         probe_port_listening,
         probe_process_running,
         probe_service_running,
@@ -561,6 +566,7 @@ class TestActiveProber(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("lsof"), "lsof not available")
     def test_probe_port_listening(self):
+        """Test probing TCP port listening state."""
         # Invalid port
         res_invalid = probe_port_listening(999999)
         self.assertFalse(res_invalid.executed)
@@ -583,6 +589,7 @@ class TestActiveProber(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("ps"), "ps not available")
     def test_probe_process_running(self):
+        """Test probing process running state and zombie process rejection."""
         # Invalid PID
         res_invalid = probe_process_running(-1)
         self.assertFalse(res_invalid.executed)
@@ -596,7 +603,7 @@ class TestActiveProber(unittest.TestCase):
         self.assertIn(str(current_pid), res_current.output)
 
         # Non-existent PID
-        with unittest.mock.patch.object(
+        with mock.patch.object(
             subprocess,
             "run",
             return_value=subprocess.CompletedProcess(args=["ps"], returncode=1, stdout="", stderr=""),
@@ -605,7 +612,68 @@ class TestActiveProber(unittest.TestCase):
             self.assertTrue(res_dead.executed)
             self.assertFalse(res_dead.success)
 
+        # Zombie process PID rejection
+        with mock.patch.object(
+            subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess(
+                args=["ps"],
+                returncode=0,
+                stdout="12345 Z+ alejandro <defunct>\n",
+                stderr="",
+            ),
+        ):
+            res_zombie = probe_process_running(12345)
+            self.assertTrue(res_zombie.executed)
+            self.assertFalse(res_zombie.success)
+            self.assertIn("zombie", res_zombie.output.lower())
+
+    def test_probe_command_available(self):
+        """Test probing command and CLI tool availability in PATH."""
+        # Known existing command (e.g. python3)
+        res_existing = probe_command_available("python3")
+        self.assertTrue(res_existing.executed)
+        self.assertTrue(res_existing.success)
+        self.assertIn("available at", res_existing.output)
+
+        # Non-existent command
+        res_missing = probe_command_available("non_existent_binary_xyz_98765")
+        self.assertTrue(res_missing.executed)
+        self.assertFalse(res_missing.success)
+        self.assertIn("not found in PATH", res_missing.output)
+
+        # Invalid command name
+        res_invalid = probe_command_available("rm -rf /")
+        self.assertFalse(res_invalid.executed)
+        self.assertFalse(res_invalid.success)
+
+    def test_probe_git_tag(self):
+        """Test probing git tags in a repository."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subprocess.run(["git", "init"], cwd=tmp_dir, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Tester"], cwd=tmp_dir, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_dir, check=True, capture_output=True)
+            with open(os.path.join(tmp_dir, "f.txt"), "w") as f:
+                f.write("test")
+            subprocess.run(["git", "add", "."], cwd=tmp_dir, check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "tag base"], cwd=tmp_dir, check=True, capture_output=True)
+            subprocess.run(["git", "tag", "v1.2.3"], cwd=tmp_dir, check=True, capture_output=True)
+
+            # Existing tag
+            res_tag = probe_git_tag("v1.2.3", tmp_dir)
+            self.assertIsNotNone(res_tag)
+            self.assertTrue(res_tag.executed)
+            self.assertTrue(res_tag.success)
+            self.assertIn("tag v1.2.3 exists", res_tag.output)
+
+            # Non-existent tag
+            res_missing_tag = probe_git_tag("v9.9.9", tmp_dir)
+            self.assertIsNotNone(res_missing_tag)
+            self.assertTrue(res_missing_tag.executed)
+            self.assertFalse(res_missing_tag.success)
+
     def test_probe_git_commit(self):
+        """Test probing git commits in a repository."""
         with tempfile.TemporaryDirectory() as tmp_dir:
             subprocess.run(["git", "init"], cwd=tmp_dir, check=True, capture_output=True)
             subprocess.run(["git", "config", "user.name", "Tester"], cwd=tmp_dir, check=True, capture_output=True)
@@ -633,12 +701,14 @@ class TestActiveProber(unittest.TestCase):
             self.assertFalse(res_bad.success)
 
     def test_probe_service_running_not_found(self):
+        """Test that an absent launchd service safely returns None."""
         # Service absent from caller's launchctl domain safely returns None rather than false CONTRADICTED
         res = probe_service_running("com.nonexistent.service.xyz.12345")
         self.assertIsNone(res)
 
     @unittest.skipUnless(shutil.which("ps"), "ps not available")
     def test_run_active_probes_for_port_pid_and_commit(self):
+        """Test draft probe extraction for ports, PIDs, and commit SHAs."""
         with tempfile.TemporaryDirectory() as tmp_dir:
             subprocess.run(["git", "init"], cwd=tmp_dir, check=True, capture_output=True)
             subprocess.run(["git", "config", "user.name", "Tester"], cwd=tmp_dir, check=True, capture_output=True)
@@ -678,6 +748,73 @@ class TestActiveProber(unittest.TestCase):
 
             commit_probe = next(p for p in probes if f"commit {short_sha}" in p.claim)
             self.assertTrue(commit_probe.success)
+
+    def test_run_active_probes_for_command_and_tag(self):
+        """Test draft probe extraction for commands and git tags."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subprocess.run(["git", "init"], cwd=tmp_dir, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Tester"], cwd=tmp_dir, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_dir, check=True, capture_output=True)
+            with open(os.path.join(tmp_dir, "f.txt"), "w") as f:
+                f.write("content")
+            subprocess.run(["git", "add", "."], cwd=tmp_dir, check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "tag commit"], cwd=tmp_dir, check=True, capture_output=True)
+            subprocess.run(["git", "tag", "v2.0.0"], cwd=tmp_dir, check=True, capture_output=True)
+
+            draft = "The python3 CLI is installed and the release is tagged as v2.0.0."
+            probes = run_active_probes_for_draft(draft, tmp_dir)
+            claims = [p.claim for p in probes]
+            self.assertTrue(any("command python3 available" in c for c in claims))
+            self.assertTrue(any("tag v2.0.0 exists" in c for c in claims))
+
+            cmd_probe = next(p for p in probes if "command python3 available" in p.claim)
+            self.assertTrue(cmd_probe.success)
+
+            tag_probe = next(p for p in probes if "tag v2.0.0 exists" in p.claim)
+            self.assertTrue(tag_probe.success)
+
+            # Negated assertions (with or without intervening words) should not trigger affirmative probes
+            negated_draft = "We did not create git tag v9.9.9, and have not yet installed fake_cli CLI."
+            neg_probes = run_active_probes_for_draft(negated_draft, tmp_dir)
+            neg_claims = [p.claim for p in neg_probes]
+            self.assertFalse(any("fake_cli" in c for c in neg_claims))
+            self.assertFalse(any("v9.9.9" in c for c in neg_claims))
+
+            # Git tag with options and message flags captures tag name and not message string
+            opt_draft = 'Ran git tag -a -m "release v2" v2.0.0 for release.'
+            opt_probes = run_active_probes_for_draft(opt_draft, tmp_dir)
+            opt_claims = [p.claim for p in opt_probes]
+            self.assertTrue(any("tag v2.0.0 exists" in c for c in opt_claims))
+            self.assertFalse(any("-a" in c for c in opt_claims))
+            self.assertFalse(any("release" in c for c in opt_claims))
+
+            # Combined options such as -am also capture the tag name rather than message
+            combined_draft = 'Ran git tag -am "release v2" v2.0.0 for release.'
+            comb_probes = run_active_probes_for_draft(combined_draft, tmp_dir)
+            comb_claims = [p.claim for p in comb_probes]
+            self.assertTrue(any("tag v2.0.0 exists" in c for c in comb_claims))
+            self.assertFalse(any("-am" in c for c in comb_claims))
+            self.assertFalse(any("release" in c for c in comb_claims))
+
+            # Tag deletion commands (e.g. -d, --delete) do not trigger existence probes
+            del_draft = "Deleted obsolete tag: git tag -d v0.9.0 and git tag --delete v0.8.0."
+            del_probes = run_active_probes_for_draft(del_draft, tmp_dir)
+            del_claims = [p.claim for p in del_probes]
+            self.assertFalse(any("v0.9.0" in c for c in del_claims))
+            self.assertFalse(any("v0.8.0" in c for c in del_claims))
+
+            # Tag names with build metadata (+) are fully matched
+            subprocess.run(["git", "tag", "v2.0.0+build.1"], cwd=tmp_dir, check=True, capture_output=True)
+            plus_draft = "The release is tagged as v2.0.0+build.1."
+            plus_probes = run_active_probes_for_draft(plus_draft, tmp_dir)
+            plus_claims = [p.claim for p in plus_probes]
+            self.assertTrue(any("tag v2.0.0+build.1 exists" in c for c in plus_claims))
+
+            # Tag probe budget bounds execution to at most MAX_TAG_PROBES
+            many_tags = " ".join(f"tagged as v1.0.{i}" for i in range(20))
+            budget_probes = run_active_probes_for_draft(many_tags, tmp_dir)
+            tag_probe_count = sum(1 for p in budget_probes if "tag" in p.claim)
+            self.assertLessEqual(tag_probe_count, 5)
 
 
 class TestDialecticAuditor(unittest.TestCase):
