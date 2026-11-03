@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 from typing import Any
 
 # Drafts that are clearly placeholders or stubs
@@ -159,14 +160,48 @@ def _pr_view_indicates_merged(res_str: str) -> bool:
     return bool(re.search(r"(?im)^\s*state:\s*merged\s*$", res_str))
 
 
-def _extract_merged_pr_number(args_str: str, res_str: str) -> str | None:
+def _extract_merged_pr_number(args_input: Any, res_str: str) -> str | None:
     """Extract actual merged PR number from gh pr merge/view command arguments or URL."""
-    arg_m = re.search(r"\bgh\s+pr\s+(?:merge|view)\s+(?:--[a-z0-9_-]+(?:\s+[^\s]+)?\s+)*#?(\d+)\b", args_str)
-    if arg_m:
-        return arg_m.group(1)
-    arg_url_m = re.search(r"\bgh\s+pr\s+(?:merge|view)\s+.*?https?://github\.com/[^/\s]+/[^/\s]+/pull/(\d+)", args_str)
-    if arg_url_m:
-        return arg_url_m.group(1)
+    if isinstance(args_input, dict):
+        cmd = args_input.get("command")
+        args_str = cmd if isinstance(cmd, str) else str(args_input)
+    else:
+        args_str = str(args_input or "")
+
+    try:
+        tokens = shlex.split(args_str)
+    except ValueError:
+        tokens = args_str.split()
+
+    subcmd_idx = -1
+    for i, tok in enumerate(tokens):
+        if tok in ("merge", "view") and i > 0 and tokens[i - 1] == "pr":
+            subcmd_idx = i
+            break
+
+    if subcmd_idx != -1:
+        opts_with_val = {
+            "-b", "--body", "-F", "--body-file", "-t", "--subject", "--template",
+            "-A", "--author-email", "-R", "--repo", "--match-head-commit",
+            "-q", "--jq", "--json",
+        }
+        idx = subcmd_idx + 1
+        while idx < len(tokens):
+            tok = tokens[idx]
+            if tok in opts_with_val:
+                idx += 2
+                continue
+            if tok.startswith("-"):
+                idx += 1
+                continue
+            url_match = re.search(r"https?://github\.com/[^/\s]+/[^/\s]+/pull/(\d+)", tok)
+            if url_match:
+                return url_match.group(1)
+            num_match = re.search(r"^(?:(?:[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)?#)?(\d+)$", tok)
+            if num_match:
+                return num_match.group(1)
+            idx += 1
+
     res_clean = res_str.strip()
     if res_clean.startswith("{") and res_clean.endswith("}"):
         try:
@@ -179,9 +214,13 @@ def _extract_merged_pr_number(args_str: str, res_str: str) -> str | None:
         url_m = re.search(r"https?://github\.com/[^/\s]+/[^/\s]+/pull/(\d+)", res_str)
         if url_m:
             return url_m.group(1)
-        res_m = re.search(r"(?i)\b(?:merged\s+)?(?:pr|pull request)\s+#?(\d+)\b", res_str)
+        res_m = re.search(r"(?i)\b(?:merged\s+)?(?:pull request|pr)\s+(?:(?:[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)?#)?(\d+)\b", res_str)
         if res_m:
             return res_m.group(1)
+        num_m = re.search(r"(?<!\w)#(\d+)\b", res_str)
+        if num_m:
+            return num_m.group(1)
+
     return None
 
 
@@ -240,8 +279,11 @@ def audit_draft_ledger(
                 rule="placeholder_draft"
             )
 
+    # Exclude non-execution advisory tools from execution matching
+    _NON_EXECUTION_TOOLS = {"consult_advisor"}
+    exec_events = [ev for ev in tool_events if ev.get("tool") not in _NON_EXECUTION_TOOLS]
     combined_tool_text = " ".join(
-        f"{ev.get('tool', '')} {ev.get('args', '')}" for ev in tool_events
+        f"{ev.get('tool', '')} {ev.get('args', '')}" for ev in exec_events
     )
     valid_evidence_lines = []
     if evidence:
@@ -263,7 +305,7 @@ def audit_draft_ledger(
         if rule_match:
             # Check if any required pattern was executed in tool events
             matching_events = [
-                ev for ev in tool_events
+                ev for ev in exec_events
                 if any(
                     re.search(req_pat, f"{ev.get('tool', '')} {ev.get('args', '')}", re.IGNORECASE)
                     for req_pat in rule["required_tool_patterns"]
@@ -335,7 +377,9 @@ def audit_draft_ledger(
                     matching_success = False
                     for ev in matching_events:
                         res_str = str(ev.get("result", ""))
-                        args_str = str(ev.get("args", ""))
+                        raw_args = ev.get("args", "")
+                        command = raw_args.get("command") if isinstance(raw_args, dict) else None
+                        args_str = command if isinstance(command, str) else str(raw_args)
                         if not _result_indicates_failure(res_str):
                             if re.search(r"\bgh\s+pr\s+view\b", args_str):
                                 if is_action_claim:
@@ -399,10 +443,10 @@ def audit_draft_ledger(
 
     # 3. Check for severe unhandled tool errors if draft claims unqualified success
     claims_clean_success = re.search(r"(?i)\b(all clean|succeeded|done successfully|everything works?|healthy)\b", scan_text)
-    if claims_clean_success and tool_events:
+    if claims_clean_success and exec_events:
         # Check only the final execution result per tool to avoid flagging retried/recovered commands
         latest_event_per_tool = {}
-        for ev in tool_events:
+        for ev in exec_events:
             tool_name = ev.get("tool", "")
             if tool_name:
                 latest_event_per_tool[tool_name] = ev

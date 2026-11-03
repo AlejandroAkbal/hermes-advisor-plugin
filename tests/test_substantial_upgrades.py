@@ -13,31 +13,39 @@ try:
     from hermes_plugins.advisor.ledger import audit_draft_ledger
     from hermes_plugins.advisor.prober import (
         probe_command_available,
+        probe_directory_existence,
+        probe_env_var,
         probe_file_existence,
         probe_git_branch,
         probe_git_clean_status,
         probe_git_commit,
+        probe_git_remote,
         probe_git_tag,
         probe_port_listening,
         probe_process_running,
         probe_service_running,
         run_active_probes_for_draft,
     )
+    from hermes_plugins.advisor.runtime import AdvisorRuntime
 except ImportError:
     from advisor.dialectic import DialecticAuditor
     from advisor.ledger import audit_draft_ledger
     from advisor.prober import (
         probe_command_available,
+        probe_directory_existence,
+        probe_env_var,
         probe_file_existence,
         probe_git_branch,
         probe_git_clean_status,
         probe_git_commit,
+        probe_git_remote,
         probe_git_tag,
         probe_port_listening,
         probe_process_running,
         probe_service_running,
         run_active_probes_for_draft,
     )
+    from advisor.runtime import AdvisorRuntime
 
 
 class TestDeterministicLedger(unittest.TestCase):
@@ -906,6 +914,221 @@ class TestDialecticAuditor(unittest.TestCase):
         # Test arbiter failure returns error status
         res_arbiter_err = auditor_fail.run_arbiter("draft", "tools", "", accusations=[{"claim": "c", "category": "cat", "evidence_gap": "gap"}])
         self.assertEqual(res_arbiter_err["status"], "error")
+
+    def test_probe_directory_existence(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            res_true = probe_directory_existence(tmpdir)
+            self.assertTrue(res_true.executed)
+            self.assertTrue(res_true.success)
+            self.assertIn("isdir=True", res_true.output)
+
+            non_existent = os.path.join(tmpdir, "missing_subdir")
+            res_false = probe_directory_existence(non_existent)
+            self.assertTrue(res_false.executed)
+            self.assertFalse(res_false.success)
+            self.assertIn("isdir=False", res_false.output)
+
+    def test_probe_env_var(self):
+        test_key = "HERMES_ADVISOR_TEST_ENV_VAR"
+        try:
+            os.environ[test_key] = "active_value"
+            res_set = probe_env_var(test_key)
+            self.assertTrue(res_set.executed)
+            self.assertTrue(res_set.success)
+            self.assertIn(f"{test_key} is set", res_set.output)
+
+            # Test dollar-prefix stripping
+            res_dollar = probe_env_var(f"${test_key}")
+            self.assertTrue(res_dollar.executed)
+            self.assertTrue(res_dollar.success)
+
+            # Test unset variable
+            res_unset = probe_env_var("HERMES_DEFINITELY_UNSET_VAR_XYZ")
+            self.assertTrue(res_unset.executed)
+            self.assertFalse(res_unset.success)
+            self.assertIn("is not set", res_unset.output)
+
+            # Test invalid variable name
+            res_invalid = probe_env_var("invalid-name-with-dashes!")
+            self.assertFalse(res_invalid.executed)
+            self.assertFalse(res_invalid.success)
+        finally:
+            os.environ.pop(test_key, None)
+
+    def test_probe_git_remote(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Not a git repo
+            self.assertIsNone(probe_git_remote("origin", tmpdir))
+
+            subprocess.run(["git", "init"], cwd=tmpdir, check=True, capture_output=True)
+            subprocess.run(["git", "remote", "add", "origin", "https://github.com/example/repo.git"], cwd=tmpdir, check=True, capture_output=True)
+
+            res = probe_git_remote("origin", tmpdir)
+            self.assertIsNotNone(res)
+            self.assertTrue(res.executed)
+            self.assertTrue(res.success)
+            self.assertEqual(res.output, "https://github.com/example/repo.git")
+
+            res_missing = probe_git_remote("upstream", tmpdir)
+            self.assertIsNotNone(res_missing)
+            self.assertTrue(res_missing.executed)
+            self.assertFalse(res_missing.success)
+            self.assertIn("not found", res_missing.output)
+
+            # Invalid / flag injection rejection
+            self.assertIsNone(probe_git_remote("-v", tmpdir))
+            self.assertIsNone(probe_git_remote("origin; rm -rf /", tmpdir))
+
+    def test_run_active_probes_for_dir_remote_and_env(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            subprocess.run(["git", "init"], cwd=tmpdir, check=True, capture_output=True)
+            subprocess.run(["git", "remote", "add", "origin", "https://github.com/test/repo.git"], cwd=tmpdir, check=True, capture_output=True)
+            test_dir = os.path.join(tmpdir, "my_export_folder")
+            os.makedirs(test_dir)
+
+            os.environ["HERMES_PROBE_TEST_ENV"] = "1"
+            try:
+                draft = f"Created directory {test_dir}. Remote origin is set. Environment variable HERMES_PROBE_TEST_ENV is set."
+                probes = run_active_probes_for_draft(draft, tmpdir)
+                commands = [p.command for p in probes]
+                self.assertTrue(any(f"test -d {test_dir}" in c for c in commands))
+                self.assertTrue(any("remote get-url origin" in c for c in commands))
+                self.assertTrue(any("HERMES_PROBE_TEST_ENV" in c for c in commands))
+
+                # Negated claims should not be probed (exercise _is_negated_claim)
+                neg_draft = f"I have not created directory {test_dir} and have never defined env var HERMES_PROBE_TEST_ENV is set."
+                neg_probes = run_active_probes_for_draft(neg_draft, tmpdir)
+                neg_cmds = [p.command for p in neg_probes]
+                self.assertFalse(any(f"test -d {test_dir}" in c for c in neg_cmds))
+                self.assertFalse(any("HERMES_PROBE_TEST_ENV" in c for c in neg_cmds))
+            finally:
+                os.environ.pop("HERMES_PROBE_TEST_ENV", None)
+
+    def test_record_tool_call_records_consult_advisor(self):
+        class MockCtx:
+            pass
+
+        rt = AdvisorRuntime(MockCtx())
+        rt.record_tool_call(
+            tool_name="consult_advisor",
+            args={"task": "Refactor router", "proposed_approach": "Use map"},
+            result="Looks solid, ensure backwards compatibility.",
+            session_id="test_sess",
+        )
+        events = rt._turn_tool_events.get("test_sess", [])
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["tool"], "consult_advisor")
+        self.assertEqual(events[0]["args"]["task"], "Refactor router")
+        self.assertIn("backwards compatibility", events[0]["result"])
+
+    def test_consult_advisor_does_not_satisfy_execution_rules(self):
+        # consult_advisor mentioning 'pytest' should not satisfy the test_suite_passed execution check
+        events = [{
+            "tool": "consult_advisor",
+            "args": {"task": "should I run pytest before committing?", "proposed_approach": "run pytest"},
+            "result": "Yes, run pytest before committing.",
+        }]
+        v = audit_draft_ledger("All tests passed.", tool_events=events)
+        self.assertFalse(v.passed)
+        self.assertEqual(v.rule, "unbacked_assertion")
+        self.assertTrue(any("test suite" in c.lower() for c in v.missing_checks))
+
+    def test_pr_merged_with_repo_slug_in_output(self):
+        # gh pr merge with repo-qualified output should successfully match PR number
+        events = [{
+            "tool": "terminal",
+            "args": "gh pr merge --repo AlejandroAkbal/hermes-advisor-plugin --merge --admin",
+            "result": "✓ Merged pull request AlejandroAkbal/hermes-advisor-plugin#23 (main).",
+        }]
+        v = audit_draft_ledger("Merged PR #23 successfully.", tool_events=events)
+        self.assertTrue(v.passed, f"Expected pass for repo-qualified merge output, got {v.reason}")
+
+    def test_pr_merged_with_options_and_subject(self):
+        # Result without a PR number forces the parser to extract from command arguments
+        events = [{
+            "tool": "terminal",
+            "args": "gh pr merge --subject 'Release 42' 23 --merge",
+            "result": "✓ Merged successfully",
+        }]
+        v = audit_draft_ledger("Merged PR #23 successfully.", tool_events=events)
+        self.assertTrue(v.passed, f"Expected pass for correct PR argument 23, got {v.reason}")
+
+        # PR #42 should NOT be approved because the actual argument is 23
+        v_wrong = audit_draft_ledger("Merged PR #42 successfully.", tool_events=events)
+        self.assertFalse(v_wrong.passed)
+
+        # Test short boolean flags -s (squash) and -m (merge) don't consume the PR argument
+        events_squash = [{
+            "tool": "terminal",
+            "args": "gh pr merge -s 23",
+            "result": "✓ Merged successfully",
+        }]
+        v_sq = audit_draft_ledger("Merged PR #23 successfully.", tool_events=events_squash)
+        self.assertTrue(v_sq.passed, f"Expected pass for squash short flag, got {v_sq.reason}")
+
+        events_merge = [{
+            "tool": "terminal",
+            "args": "gh pr merge -m 23",
+            "result": "✓ Merged successfully",
+        }]
+        v_mg = audit_draft_ledger("Merged PR #23 successfully.", tool_events=events_merge)
+        self.assertTrue(v_mg.passed, f"Expected pass for merge short flag, got {v_mg.reason}")
+
+    def test_pr_merged_with_dict_args(self):
+        # When tool event args is a dictionary with a "command" key
+        events = [{
+            "tool": "terminal",
+            "args": {"command": "gh pr merge 23 --merge"},
+            "result": "✓ Merged successfully",
+        }]
+        v = audit_draft_ledger("Merged PR #23 successfully.", tool_events=events)
+        self.assertTrue(v.passed, f"Expected pass for dict-shaped args, got {v.reason}")
+
+    def test_advisory_errors_do_not_trigger_unacknowledged_failure(self):
+        # An advisory result quoting an error should not trigger unacknowledged tool failure
+        events = [{
+            "tool": "consult_advisor",
+            "args": {"task": "how to fix SyntaxError"},
+            "result": "SyntaxError: invalid syntax in file.py",
+        }]
+        v = audit_draft_ledger("Everything works.", tool_events=events)
+        self.assertTrue(v.passed)
+
+    def test_filler_words_rejected_by_extractors(self):
+        # Auxiliary words like 'was' and 'already' must not become probe targets
+        draft = "The directory was created. The remote already exists. Environment variable was set."
+        with tempfile.TemporaryDirectory() as tmpdir:
+            probes = run_active_probes_for_draft(draft, tmpdir)
+            commands = [p.command for p in probes]
+            self.assertFalse(any("test -d" in c and "was" in c for c in commands))
+            self.assertFalse(any("remote get-url already" in c for c in commands))
+            self.assertFalse(any("test -n" in c and "was" in c for c in commands))
+
+    def test_probe_git_remote_redacts_credentials(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            subprocess.run(["git", "init"], cwd=tmpdir, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "remote", "add", "origin", "https://user:p@ssword123@github.com/example/repo.git"],
+                cwd=tmpdir,
+                check=True,
+                capture_output=True,
+            )
+            res = probe_git_remote("origin", tmpdir)
+            self.assertIsNotNone(res)
+            self.assertTrue(res.executed)
+            self.assertTrue(res.success)
+            self.assertNotIn("p@ssword123", res.output)
+            self.assertNotIn("ssword", res.output)
+            self.assertIn("***@github.com", res.output)
+
+    def test_bare_directory_extraction(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            logs_dir = os.path.join(tmpdir, "logs")
+            os.makedirs(logs_dir)
+            draft = "Created directory logs."
+            probes = run_active_probes_for_draft(draft, tmpdir)
+            commands = [p.command for p in probes]
+            self.assertTrue(any(f"test -d {logs_dir}" in c for c in commands))
 
 
 if __name__ == "__main__":

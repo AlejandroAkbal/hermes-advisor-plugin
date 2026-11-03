@@ -634,14 +634,15 @@ class AdvisorRuntime:
         self, *, tool_name: str = "", args: dict | None = None, result: Any = None, session_id: str = "", **kwargs
     ) -> None:
         """Record tool execution for the active turn in a thread-safe buffer."""
-        if tool_name in ("verify_turn", "consult_advisor", "tool_search", "tool_describe"):
+        if tool_name in ("verify_turn", "tool_search", "tool_describe"):
             return
         sess = session_id or "default"
         with self._state_lock:
             if sess not in self._turn_tool_events:
                 self._turn_tool_events[sess] = []
-            # Any new action invalidates a prior approval for this turn.
-            self._turn_verified[sess] = False
+            # Any new action invalidates a prior approval for this turn (advisory calls do not mutate state).
+            if tool_name != "consult_advisor":
+                self._turn_verified[sess] = False
             res_str = str(result) if result is not None else ""
             res_str = _redact_secrets(res_str)
             if len(res_str) > 2000:
