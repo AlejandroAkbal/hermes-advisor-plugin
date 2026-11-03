@@ -229,6 +229,19 @@ def _get_git_diff(cwd: str, paths: list[str], max_chars: int = 12000) -> str | N
         return None
 
 
+def _user_key(text) -> str:
+    """Stable short key for the user request a rejection belongs to."""
+    if isinstance(text, list):
+        text = " ".join(
+            str(block.get("text") or "") if isinstance(block, dict) else str(block)
+            for block in text
+        )
+    elif isinstance(text, dict):
+        text = str(text.get("text") or "")
+    normalized = " ".join(str(text or "").split())
+    return hashlib.sha1(normalized.encode("utf-8", "ignore")).hexdigest()[:12]
+
+
 def _clip_directive(text: str, cap: int) -> str:
     """Clip a directive preserving both leading context and trailing instructions."""
     text = text.strip()
@@ -351,6 +364,8 @@ class AdvisorRuntime:
         self._turn_tool_events: dict[str, list[dict]] = {}
         self._turn_verified: dict[str, bool] = {}
         self._session_history: dict[str, list[dict]] = {}
+        # Last rejection per session, replayed as guidance on the redraft.
+        self._rejections: dict[str, dict] = {}
 
         # Current turn tracking — populated from post_llm_call kwargs
         self.last_turn_key: tuple[str, str] | None = None
@@ -728,23 +743,51 @@ class AdvisorRuntime:
         """Inject verification directive into active turn context for all sessions."""
         sess = session_id or "default"
         history = kwargs.get("conversation_history")
+        last_user = ""
+        if history:
+            for m in reversed(history):
+                if isinstance(m, dict) and m.get("role") == "user":
+                    last_user = str(m.get("content") or "")
+                    break
         with self._state_lock:
             self._turn_tool_events[sess] = []
             self._turn_verified[sess] = False
             if history:
                 self._session_history[sess] = list(history[-20:])
+            pending = self._rejections.get(sess)
+            if pending and last_user and pending.get("user_key") != _user_key(last_user):
+                self._rejections.pop(sess, None)
+                pending = None
 
         if not self.state.enabled or os.environ.get(ADVISOR_NO_REVIEW):
             return {}
 
-        return {
-            "context": (
-                "[Verification Gate]: On any turn where you executed tools or performed actions, you must call "
-                'verify_turn(draft="<your natural response for user>", evidence="<optional technical verification notes for auditor>") '
-                "before delivering your final answer. The draft should be natural, direct, and human (no robotic compliance text or routine tool plumbing; "
-                "surface material failures or decisions plainly); raw technical proofs and tool details belong in evidence or tool events."
+        context = (
+            "[Verification Gate]: On any turn where you executed tools or performed actions, you must call "
+            'verify_turn(draft="<your natural response for user>", evidence="<optional technical verification notes for auditor>") '
+            "before delivering your final answer. The draft should be natural, direct, and human (no robotic compliance text or routine tool plumbing; "
+            "surface material failures or decisions plainly); raw technical proofs and tool details belong in evidence or tool events."
+        )
+        if pending:
+            reason = _clip_directive(str(pending.get("reason", "")), 700)
+            context += (
+                "\n\n[Advisor redraft guidance]: your previous draft for this request was rejected. "
+                f"Fix exactly this and nothing else: {reason}\n"
+                "Rewrite only from tool output you can point to, drop any claim you cannot corroborate, "
+                "then call verify_turn again."
             )
-        }
+        return {"context": context}
+
+    def _record_rejection(self, sess: str, verdict: dict, user_key: str) -> None:
+        """Remember why the draft failed so the next redraft targets that defect."""
+        with self._state_lock:
+            prior = self._rejections.get(sess) or {}
+            same_request = prior.get("user_key") == user_key
+            self._rejections[sess] = {
+                "count": (int(prior.get("count", 0)) + 1) if same_request else 1,
+                "reason": str(verdict.get("reason", ""))[:2000],
+                "user_key": user_key,
+            }
 
     def verify_turn(
         self,
@@ -796,12 +839,22 @@ class AdvisorRuntime:
 
         combined_evidence = f"{evidence}\n" + "\n".join(probe_notes) if probe_notes else evidence
 
+        user_key = _user_key(latest_user_query)
+        with self._state_lock:
+            prior_rejections = self._rejections.get(sess) or {}
+        rejections = (
+            int(prior_rejections.get("count", 0))
+            if prior_rejections.get("user_key") == user_key
+            else 0
+        )
+
         # Deterministic ledger pre-flight verification
         ledger_verdict = audit_draft_ledger(draft, events, combined_evidence, claims=claims)
         if not ledger_verdict.passed:
             verdict = ledger_verdict.to_dict()
             if probe_notes:
                 verdict["reason"] = f"{verdict.get('reason', '')} Active probe notes: " + " ".join(probe_notes)
+            self._record_rejection(sess, verdict, user_key)
             return verdict
 
         system_prompt = (
@@ -822,6 +875,13 @@ class AdvisorRuntime:
             "6. If the draft is sound, truthful, answers the user's ask, and is written naturally for a human, APPROVE.\n\n"
             'Respond in JSON format: {"status": "approved" | "rejected", "reason": "...", "missing_checks": [...], "unbacked_claims": [...]}'
         )
+        if rejections >= 2:
+            system_prompt += (
+                f"\n\nREDRAFT ESCALATION: this response has already been rejected {rejections} times. "
+                "Approve it when its material claims are corroborated and it answers the user's request. "
+                "Reject for a claim contradicted by tool output, a fabricated result, an uncorroborated material claim, or a missed user instruction — "
+                "not for precision, phrasing, or missing detail."
+            )
 
         user_prompt_parts = []
         if guidelines:
@@ -910,6 +970,9 @@ class AdvisorRuntime:
             if parsed["status"] == "approved":
                 with self._state_lock:
                     self._turn_verified[sess] = True
+                    self._rejections.pop(sess, None)
+            elif parsed["status"] == "rejected":
+                self._record_rejection(sess, parsed, user_key)
             return parsed
         except Exception as exc:
             logger.warning("verify_turn audit failed: %s", exc)
