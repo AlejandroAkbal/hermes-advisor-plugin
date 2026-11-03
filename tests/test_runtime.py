@@ -143,8 +143,19 @@ class TestAdvisorRuntime(unittest.TestCase):
         self.assertIn("earlier events omitted", rendered[0])
         self.assertLess(len(rendered), len(events))
         self.assertLessEqual(
-            len("\n\n".join(rendered)), runtime_mod.AUDIT_EVENT_BUDGET_CHARS + 500
+            len("\n\n".join(rendered)), runtime_mod.AUDIT_EVENT_BUDGET_CHARS
         )
+
+    def test_format_audit_events_respects_budget_at_boundary(self):
+        _format_audit_events = runtime_mod._format_audit_events
+        events = [
+            {"tool": "terminal", "args": "a" * 900, "result": "r" * 5000}
+            for _ in range(6)
+        ]
+        for budget in (900, 1200, 2500):
+            with mock_patch.object(runtime_mod, "AUDIT_EVENT_BUDGET_CHARS", budget):
+                rendered = _format_audit_events(events)
+            self.assertLessEqual(len("\n\n".join(rendered)), budget, f"budget {budget}")
 
     def test_format_history_scopes_tool_calls_to_current_turn(self):
         _format_history = runtime_mod.AdvisorRuntime._format_history

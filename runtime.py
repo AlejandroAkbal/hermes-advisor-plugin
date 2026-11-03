@@ -32,6 +32,8 @@ AUDIT_EVENT_BUDGET_CHARS = 48_000
 AUDIT_RECENT_EVENTS = 10
 AUDIT_RECENT_EVENT_CHARS = 4_000
 AUDIT_OLDER_EVENT_CHARS = 400
+# Room kept back per event for the header, args and the truncation marker.
+AUDIT_EVENT_HEADER_RESERVE = 400
 
 _SECRET_PATTERNS = (
     re.compile(r"sk-[a-zA-Z0-9_-]{20,}"),
@@ -232,6 +234,8 @@ def _clip_directive(text: str, cap: int) -> str:
     text = text.strip()
     if len(text) <= cap:
         return text
+    if cap <= 40:
+        return text[:cap]
     head = cap * 2 // 5
     tail = cap - head - 20
     return f"{text[:head]} …[{len(text) - cap} chars]… {text[-tail:]}"
@@ -258,11 +262,12 @@ def _format_audit_events(events: list[dict]) -> list[str]:
     remaining = AUDIT_EVENT_BUDGET_CHARS
     total = len(events)
     for offset, ev in enumerate(reversed(events)):
-        if remaining <= 0:
+        if remaining <= AUDIT_EVENT_HEADER_RESERVE:
             rendered.append(f"[{total - offset} earlier events omitted — audit budget exhausted]")
             break
         detailed = offset < AUDIT_RECENT_EVENTS
-        cap = min(AUDIT_RECENT_EVENT_CHARS if detailed else AUDIT_OLDER_EVENT_CHARS, remaining)
+        want = AUDIT_RECENT_EVENT_CHARS if detailed else AUDIT_OLDER_EVENT_CHARS
+        cap = min(want, remaining - AUDIT_EVENT_HEADER_RESERVE)
         line = (
             f"{total - offset}. Tool: {ev.get('tool', '')}\n"
             f"   Args: {_clip_directive(str(ev.get('args', '')), 300)}\n"
