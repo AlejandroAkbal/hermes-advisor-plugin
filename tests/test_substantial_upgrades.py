@@ -508,7 +508,7 @@ class TestActiveProber(unittest.TestCase):
         self.assertTrue(res_missing.executed)
         self.assertTrue(res_missing.success)
         self.assertIn("absent=True", res_missing.output)
-        self.assertEqual(res_missing.command, "test ! -e /tmp/non_existent_deleted_file_xyz_123.py")
+        self.assertEqual(res_missing.command, "test ! -e /tmp/non_existent_deleted_file_xyz_123.py && test ! -L /tmp/non_existent_deleted_file_xyz_123.py")
 
         # Existing file contradicts absence
         with tempfile.NamedTemporaryFile() as tmp:

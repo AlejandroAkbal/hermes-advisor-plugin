@@ -170,7 +170,7 @@ def probe_file_absence(path: str) -> ProbeResult:
             executed=True,
             success=is_absent,
             claim=f"path absent: {clean_path}",
-            command=f"test ! -e {clean_path}",
+            command=f"test ! -e {clean_path} && test ! -L {clean_path}",
             output=out,
         )
     except Exception as e:
@@ -178,7 +178,7 @@ def probe_file_absence(path: str) -> ProbeResult:
             executed=False,
             success=False,
             claim=f"path absent: {clean_path}",
-            command=f"test ! -e {clean_path}",
+            command=f"test ! -e {clean_path} && test ! -L {clean_path}",
             output=f"Probe inconclusive: {e}",
         )
 
@@ -885,7 +885,7 @@ def run_active_probes_for_draft(draft: str, cwd: str) -> list[ProbeResult]:
     MAX_ABSENCE_PROBES = 5
     absence_patterns = [
         re.compile(
-            rf"(?i)(?<!not )(?<!never )(?<!n't )\b(?:deleted|removed|purged|cleaned\s+up|dropped)\s+(?:the\s+)?(?:temporary\s+)?(?:file|script|artifact|directory|folder)?\s*[`'\"]?([/~a-zA-Z0-9_\-./]+(?:\.{ext_pattern})(?![\w\-]))[`'\"]?"
+            rf"(?i)(?<!not )(?<!never )(?<!n't )\b(?:deleted|removed|purged|cleaned\s+up|dropped)\s+(?:the\s+)?(?:temporary\s+)?(?:file|script|artifact|directory|folder)?\s*[`'\"]?([/~a-zA-Z0-9_\-./]+(?:\.{ext_pattern})(?![\w\-]|(?:\.[a-zA-Z0-9])))[`'\"]?"
         ),
         re.compile(
             rf"(?i)(?<!not )(?<!never )(?<!n't )[`'\"]?([/~a-zA-Z0-9_\-./]+(?:\.{ext_pattern}))[`'\"]?\s+(?:was\s+|is\s+|has\s+been\s+)?(?:deleted|removed|purged|cleaned\s+up|dropped|gone)\b"
