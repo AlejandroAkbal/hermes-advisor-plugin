@@ -39,10 +39,36 @@ def analyze_recent_performance(lookback_hours: float = 24.0) -> dict:
                 ORDER BY timestamp ASC
             """, (since_ts,))
             rows = cursor.fetchall()
+            cursor.execute("""
+                SELECT r.timestamp - a.timestamp
+                FROM messages r
+                JOIN messages a
+                  ON a.session_id = r.session_id
+                 AND a.role = 'assistant'
+                 AND a.tool_calls LIKE '%verify_turn%'
+                 AND a.timestamp < r.timestamp
+                WHERE r.tool_name = 'verify_turn' AND r.active = 1 AND r.timestamp >= ?
+                  AND a.timestamp = (
+                      SELECT MAX(a2.timestamp) FROM messages a2
+                      WHERE a2.session_id = r.session_id AND a2.role = 'assistant'
+                        AND a2.tool_calls LIKE '%verify_turn%' AND a2.timestamp < r.timestamp
+                  )
+            """, (since_ts,))
+            latency_rows = cursor.fetchall()
     except Exception as exc:
         return {"error": f"Failed to query state.db: {exc}"}
 
     total_audits = len(rows)
+    latencies = sorted(
+        d for (d,) in latency_rows if d is not None and 0 <= d <= 300
+    )
+
+    def percentile(pct: float) -> float:
+        if not latencies:
+            return 0.0
+        idx = min(len(latencies) - 1, max(0, round((pct / 100) * (len(latencies) - 1))))
+        return round(latencies[idx], 2)
+
     if total_audits == 0:
         return {
             "lookback_hours": lookback_hours,
@@ -50,6 +76,9 @@ def analyze_recent_performance(lookback_hours: float = 24.0) -> dict:
             "approved": 0,
             "rejected": 0,
             "approval_rate_pct": 0.0,
+            "audit_latency_median_s": 0.0,
+            "audit_latency_p90_s": 0.0,
+            "audit_latency_samples": 0,
             "categories": {},
             "top_rejection_reasons": [],
             "actionable_recommendations": ["No recent audits found in window. Continue monitoring."]
@@ -142,6 +171,12 @@ def analyze_recent_performance(lookback_hours: float = 24.0) -> dict:
             f"Leading recognized failure mode is {top_cat} ({top_count} occurrences){other_note}: {advice}"
         )
 
+    if percentile(90) > 45:
+        recommendations.append(
+            f"Audit latency is high (median {percentile(50)}s, p90 {percentile(90)}s over "
+            f"{len(latencies)} samples): keep the audit evidence budget lean and trim the prompt."
+        )
+
     return {
         "lookback_hours": lookback_hours,
         "total_audits": total_audits,
@@ -149,6 +184,9 @@ def analyze_recent_performance(lookback_hours: float = 24.0) -> dict:
         "rejected": rejected_count,
         "approval_rate_pct": round((approved_count / total_audits) * 100, 1),
         "rejection_rate_pct": round((rejected_count / total_audits) * 100, 1),
+        "audit_latency_median_s": percentile(50),
+        "audit_latency_p90_s": percentile(90),
+        "audit_latency_samples": len(latencies),
         "categories": categories,
         "sample_rejection_reasons": reasons[-5:] if reasons else [],
         "actionable_recommendations": recommendations,
@@ -176,6 +214,12 @@ def main():
     print(f"Total Audits:    {metrics['total_audits']}")
     print(f"Approved:        {metrics['approved']} ({metrics['approval_rate_pct']}%)")
     print(f"Rejected:        {metrics['rejected']} ({metrics['rejection_rate_pct']}%)")
+    if metrics.get("audit_latency_samples"):
+        print(
+            f"Audit latency:   median {metrics['audit_latency_median_s']}s, "
+            f"p90 {metrics['audit_latency_p90_s']}s "
+            f"({metrics['audit_latency_samples']} samples)"
+        )
     print("\nCategorized Failure Modes:")
     for cat, count in sorted(metrics["categories"].items(), key=lambda x: x[1], reverse=True):
         pct = (count / max(1, metrics['rejected'])) * 100
