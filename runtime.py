@@ -25,6 +25,16 @@ WATCHDOG_FILENAME = "WATCHDOG.md"
 REVIEW_TIMEOUT_SECONDS = 90
 SHUTDOWN_GRACE_SECONDS = 1.0
 
+# Tool results are clipped once on record; the audit renderer then spends a
+# fixed budget on the newest events so long outputs keep their head and tail.
+TOOL_RESULT_CAP_CHARS = 6_000
+AUDIT_EVENT_BUDGET_CHARS = 48_000
+AUDIT_RECENT_EVENTS = 10
+AUDIT_RECENT_EVENT_CHARS = 4_000
+AUDIT_OLDER_EVENT_CHARS = 400
+# Room kept back per event for the header, args and the truncation marker.
+AUDIT_EVENT_HEADER_RESERVE = 400
+
 _SECRET_PATTERNS = (
     re.compile(r"sk-[a-zA-Z0-9_-]{20,}"),
     re.compile(r"ghp_[a-zA-Z0-9]{36}"),
@@ -229,9 +239,49 @@ def _clip_directive(text: str, cap: int) -> str:
     text = text.strip()
     if len(text) <= cap:
         return text
+    if cap <= 40:
+        return text[:cap]
     head = cap * 2 // 5
     tail = cap - head - 20
     return f"{text[:head]} …[{len(text) - cap} chars]… {text[-tail:]}"
+
+
+def _clip_result(text: str, cap: int) -> str:
+    """Clip a tool result keeping both ends, so head and tail stay auditable."""
+    if len(text) <= cap:
+        return text
+    head = cap // 3
+    tail = cap - head
+    return f"{text[:head]}\n... [truncated {len(text) - cap} chars] ...\n{text[-tail:]}"
+
+
+def _format_audit_events(events: list[dict]) -> list[str]:
+    """Render tool events for the auditor, spending the budget on the newest ones.
+
+    A draft cites the results it just saw, so the last few events keep their head
+    and tail while older events collapse to a stub. Per-event clipping alone hid
+    the middle of long outputs, and the auditor then rejected well-grounded
+    claims as unverifiable.
+    """
+    rendered: list[str] = []
+    remaining = AUDIT_EVENT_BUDGET_CHARS
+    total = len(events)
+    for offset, ev in enumerate(reversed(events)):
+        if remaining <= AUDIT_EVENT_HEADER_RESERVE:
+            rendered.append(f"[{total - offset} earlier events omitted — audit budget exhausted]")
+            break
+        detailed = offset < AUDIT_RECENT_EVENTS
+        want = AUDIT_RECENT_EVENT_CHARS if detailed else AUDIT_OLDER_EVENT_CHARS
+        cap = min(want, remaining - AUDIT_EVENT_HEADER_RESERVE)
+        line = (
+            f"{total - offset}. Tool: {ev.get('tool', '')}\n"
+            f"   Args: {_clip_directive(str(ev.get('args', '')), 300)}\n"
+            f"   Result: {_clip_directive(str(ev.get('result', '')), cap)}"
+        )
+        remaining -= len(line)
+        rendered.append(line)
+    rendered.reverse()
+    return rendered
 
 
 def _collect_directives(user_msgs: list[str]) -> list[str]:
@@ -652,14 +702,7 @@ class AdvisorRuntime:
                 self._turn_verified[sess] = False
             res_str = str(result) if result is not None else ""
             res_str = _redact_secrets(res_str)
-            if len(res_str) > 2000:
-                head_len = 650
-                tail_len = 1350
-                res_str = (
-                    res_str[:head_len]
-                    + f"\n... [truncated {len(res_str) - 2000} chars] ...\n"
-                    + res_str[-tail_len:]
-                )
+            res_str = _clip_result(res_str, TOOL_RESULT_CAP_CHARS)
             clean_args = _redact_secrets_obj(args) if args else {}
             self._turn_tool_events[sess].append({
                 "tool": tool_name,
@@ -866,9 +909,7 @@ class AdvisorRuntime:
             if formatted_history:
                 user_prompt_parts.append("### Recent Conversation Dialogue:\n" + "\n\n".join(formatted_history))
 
-        events_formatted = []
-        for i, ev in enumerate(events, 1):
-            events_formatted.append(f"{i}. Tool: {ev['tool']}\n   Args: {ev['args']}\n   Result: {ev['result']}")
+        events_formatted = _format_audit_events(events)
         user_prompt_parts.append("### Tool Execution Events (This Turn):\n" + ("\n\n".join(events_formatted) if events_formatted else "None (no tools called)."))
 
         if draft:
