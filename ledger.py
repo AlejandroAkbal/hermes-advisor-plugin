@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 from typing import Any
 
 # Drafts that are clearly placeholders or stubs
@@ -161,12 +162,6 @@ def _pr_view_indicates_merged(res_str: str) -> bool:
 
 def _extract_merged_pr_number(args_str: str, res_str: str) -> str | None:
     """Extract actual merged PR number from gh pr merge/view command arguments or URL."""
-    arg_m = re.search(r"\bgh\s+pr\s+(?:merge|view)\b.*?(?:^|\s)(?:[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)?#?(\d+)\b", args_str)
-    if arg_m:
-        return arg_m.group(1)
-    arg_url_m = re.search(r"\bgh\s+pr\s+(?:merge|view)\s+.*?https?://github\.com/[^/\s]+/[^/\s]+/pull/(\d+)", args_str)
-    if arg_url_m:
-        return arg_url_m.group(1)
     res_clean = res_str.strip()
     if res_clean.startswith("{") and res_clean.endswith("}"):
         try:
@@ -185,6 +180,40 @@ def _extract_merged_pr_number(args_str: str, res_str: str) -> str | None:
         num_m = re.search(r"(?<!\w)#(\d+)\b", res_str)
         if num_m:
             return num_m.group(1)
+
+    try:
+        tokens = shlex.split(args_str)
+    except Exception:
+        tokens = args_str.split()
+
+    subcmd_idx = -1
+    for i, tok in enumerate(tokens):
+        if tok in ("merge", "view") and i > 0 and tokens[i - 1] == "pr":
+            subcmd_idx = i
+            break
+
+    if subcmd_idx != -1:
+        opts_with_val = {
+            "-b", "--body", "-F", "--body-file", "-t", "--title", "-s", "--subject",
+            "-R", "--repo", "-m", "--match-head-commit", "-q", "--jq", "--template"
+        }
+        idx = subcmd_idx + 1
+        while idx < len(tokens):
+            tok = tokens[idx]
+            if tok in opts_with_val:
+                idx += 2
+                continue
+            if tok.startswith("-"):
+                idx += 1
+                continue
+            url_match = re.search(r"https?://github\.com/[^/\s]+/[^/\s]+/pull/(\d+)", tok)
+            if url_match:
+                return url_match.group(1)
+            num_match = re.search(r"^(?:[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)?#?(\d+)$", tok)
+            if num_match:
+                return num_match.group(1)
+            idx += 1
+
     return None
 
 

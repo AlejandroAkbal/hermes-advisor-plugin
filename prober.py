@@ -431,6 +431,14 @@ def probe_git_tag(tag_name: str, cwd: str) -> ProbeResult | None:
         )
 
 
+def _redact_url_credentials(url: str) -> str:
+    """Redact embedded credentials from git URLs before exposing in evidence."""
+    redacted = re.sub(r"://([^/@:\s]+):([^/@\s]+)@", r"://\1:***@", url)
+    if "://" in redacted:
+        redacted = re.sub(r"://([^/@\s:]+)@", r"://***@", redacted)
+    return redacted
+
+
 def probe_git_remote(remote_name: str, cwd: str) -> ProbeResult | None:
     """Safely probe if a git remote is configured and retrieve its URL."""
     if not _is_git_work_tree(cwd):
@@ -451,7 +459,7 @@ def probe_git_remote(remote_name: str, cwd: str) -> ProbeResult | None:
             check=False,
         )
         if proc.returncode == 0 and proc.stdout.strip():
-            url = proc.stdout.strip()
+            url = _redact_url_credentials(proc.stdout.strip())
             return ProbeResult(
                 executed=True,
                 success=True,
@@ -590,7 +598,10 @@ def _extract_directory_paths(draft: str, cwd: str) -> list[str]:
         re.compile(r"(?i)\b(?:created|made)\s+(?:directory|folder)\s+[`'\"]?([/~a-zA-Z0-9_\-./]+)[`'\"]?\b"),
         re.compile(r"(?i)\b(?:in|into|under)\s+(?:directory|folder)\s+[`'\"]?([/~a-zA-Z0-9_\-./]+)[`'\"]?\b"),
     ]
-    ignored = {"the", "a", "an", "this", "that", "our", "new", "all", "each", "and", "or", "to", "is", "for", "with"}
+    ignored = {
+        "the", "a", "an", "this", "that", "our", "new", "all", "each", "and", "or", "to", "is", "for", "with",
+        "structure", "hierarchy", "tree", "layout", "permissions", "size", "contents", "path", "name",
+    }
     paths: list[str] = []
     for pat in patterns:
         for m in pat.finditer(draft):
@@ -599,7 +610,7 @@ def _extract_directory_paths(draft: str, cwd: str) -> list[str]:
             cand = m.group(1).strip().rstrip(".,;:!?)'\"")
             if not cand or cand.lower() in ignored:
                 continue
-            if "/" in cand or cand.startswith("~") or cand.startswith("."):
+            if "/" in cand or cand.startswith("~") or cand.startswith(".") or re.fullmatch(r"[a-zA-Z0-9_\-]+", cand):
                 expanded = os.path.expanduser(cand)
                 if not os.path.isabs(expanded):
                     expanded = os.path.abspath(os.path.join(cwd, expanded))

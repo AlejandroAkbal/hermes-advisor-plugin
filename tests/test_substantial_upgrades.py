@@ -1031,6 +1031,45 @@ class TestDialecticAuditor(unittest.TestCase):
         v = audit_draft_ledger("Merged PR #23 successfully.", tool_events=events)
         self.assertTrue(v.passed, f"Expected pass for repo-qualified merge output, got {v.reason}")
 
+    def test_pr_merged_with_options_and_subject(self):
+        # Options containing numbers like --subject 'Release 42' should not confuse the PR number 23
+        events = [{
+            "tool": "terminal",
+            "args": "gh pr merge --subject 'Release 42' 23 --merge",
+            "result": "✓ Merged pull request #23",
+        }]
+        v = audit_draft_ledger("Merged PR #23 successfully.", tool_events=events)
+        self.assertTrue(v.passed, f"Expected pass for correct PR argument 23, got {v.reason}")
+
+        # PR #42 should NOT be approved because the actual argument is 23
+        v_wrong = audit_draft_ledger("Merged PR #42 successfully.", tool_events=events)
+        self.assertFalse(v_wrong.passed)
+
+    def test_probe_git_remote_redacts_credentials(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            subprocess.run(["git", "init"], cwd=tmpdir, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "remote", "add", "origin", "https://user:secret123@github.com/example/repo.git"],
+                cwd=tmpdir,
+                check=True,
+                capture_output=True,
+            )
+            res = probe_git_remote("origin", tmpdir)
+            self.assertIsNotNone(res)
+            self.assertTrue(res.executed)
+            self.assertTrue(res.success)
+            self.assertNotIn("secret123", res.output)
+            self.assertIn("user:***@github.com", res.output)
+
+    def test_bare_directory_extraction(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            logs_dir = os.path.join(tmpdir, "logs")
+            os.makedirs(logs_dir)
+            draft = "Created directory logs."
+            probes = run_active_probes_for_draft(draft, tmpdir)
+            commands = [p.command for p in probes]
+            self.assertTrue(any(f"test -d {logs_dir}" in c for c in commands))
+
 
 if __name__ == "__main__":
     unittest.main()
