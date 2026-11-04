@@ -107,6 +107,49 @@ class TestGatewayLive(unittest.TestCase):
              mock.patch.object(gl, "_child_gateway_pid", lambda parent: 222):
             self.assertEqual(gl.gateway_pid(), 222)
 
+    def test_wait_until_idle_returns_true_with_no_turns(self):
+        with mock.patch.object(gl, "gateway_activity", lambda: (0, "running")):
+            self.assertTrue(gl.wait_until_idle(60))
+
+    def _fake_clock(self, step: float = 1.0):
+        ticks = {"now": 10_000.0}
+
+        def _now() -> float:
+            ticks["now"] += step
+            return ticks["now"]
+
+        return _now
+
+    def test_wait_until_idle_times_out_while_turns_run(self):
+        with mock.patch.object(gl, "gateway_activity", lambda: (2, "running")), \
+             mock.patch.object(gl.time, "sleep", lambda _s: None), \
+             mock.patch.object(gl.time, "time", self._fake_clock(10.0)), \
+             mock.patch.object(gl, "_log", lambda _m: None):
+            self.assertFalse(gl.wait_until_idle(5))
+
+    def test_wait_until_idle_never_restarts_on_draining(self):
+        with mock.patch.object(gl, "gateway_activity", lambda: (0, "draining")), \
+             mock.patch.object(gl.time, "sleep", lambda _s: None), \
+             mock.patch.object(gl.time, "time", self._fake_clock(10.0)), \
+             mock.patch.object(gl, "_log", lambda _m: None):
+            self.assertFalse(gl.wait_until_idle(5))
+
+    def test_wait_until_idle_fails_closed_when_state_unreadable(self):
+        with mock.patch.object(gl, "gateway_activity", lambda: None), \
+             mock.patch.object(gl, "_log", lambda _m: None):
+            self.assertFalse(gl.wait_until_idle(60))
+
+    def test_restart_worker_does_not_signal_while_busy(self):
+        signals = []
+        with mock.patch.object(gl, "gateway_activity", lambda: (1, "running")), \
+             mock.patch.object(gl.os, "kill", lambda pid, sig: signals.append(pid)), \
+             mock.patch.object(gl.time, "sleep", lambda _s: None), \
+             mock.patch.object(gl.time, "time", self._fake_clock(10.0)), \
+             mock.patch.object(gl, "_log", lambda _m: None):
+            rc = gl._restart_worker(Path("."), 0, idle=True, max_wait_seconds=5)
+        self.assertEqual(rc, 6)
+        self.assertEqual(signals, [])
+
 
 if __name__ == "__main__":
     unittest.main()
