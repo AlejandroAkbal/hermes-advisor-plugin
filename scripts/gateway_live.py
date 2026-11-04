@@ -25,6 +25,7 @@ from pathlib import Path
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 LOG_PATH = Path.home() / ".hermes" / "advisor" / "gateway_live.log"
 GATEWAY_PID_PATH = Path.home() / ".hermes" / "gateway.pid"
+GATEWAY_STATE_PATH = Path.home() / ".hermes" / "gateway_state.json"
 STATUS_PID_RE = re.compile(r"PID (\d+)")
 # How long we allow the gateway to finish its in-flight turn and respawn before
 # declaring the restart failed. The drain itself is not launchd-bounded: in-band
@@ -159,9 +160,46 @@ def _log(message: str) -> None:
         handle.write(f"{stamp} {message}\n")
 
 
-def _restart_worker(repo: Path, wait_seconds: int, signal_only: bool = False) -> int:
+def gateway_activity() -> tuple[int, str] | None:
+    """(active agent turns, gateway_state) from the gateway's own state file.
+
+    None means the file is unreadable, which the caller treats as "not safe to
+    restart": a restart armed against unknown activity is how turns get killed.
+    """
+    try:
+        state = json.loads(GATEWAY_STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    active = state.get("active_agents")
+    if not isinstance(active, int):
+        active = 0
+    return active, str(state.get("gateway_state") or "")
+
+
+def wait_until_idle(max_wait_seconds: int, poll_seconds: int = 10) -> bool:
+    """Block until no agent turn is running. False when the wait timed out."""
+    deadline = time.time() + max_wait_seconds
+    while True:
+        activity = gateway_activity()
+        if activity is None:
+            _log("gateway state unreadable; not restarting while activity is unknown")
+            return False
+        active, state = activity
+        if active == 0 and state != "draining":
+            return True
+        if time.time() >= deadline:
+            _log(f"still {active} active turn(s) after {max_wait_seconds}s; giving up without signalling")
+            return False
+        _log(f"waiting for idle: {active} active turn(s), state={state or 'unknown'}")
+        time.sleep(poll_seconds)
+
+
+def _restart_worker(repo: Path, wait_seconds: int, signal_only: bool = False,
+                    idle: bool = False, max_wait_seconds: int = 0) -> int:
     _log(f"restart scheduled in {wait_seconds}s for {repo}")
     time.sleep(wait_seconds)
+    if idle and not wait_until_idle(max_wait_seconds):
+        return 6
     pid = gateway_pid()
     if pid is None:
         _log("no gateway pid; nothing to signal")
@@ -188,9 +226,10 @@ def _restart_worker(repo: Path, wait_seconds: int, signal_only: bool = False) ->
     return 5
 
 
-def restart(repo: Path, wait_seconds: int, detach: bool, signal_only: bool = False) -> int:
+def restart(repo: Path, wait_seconds: int, detach: bool, signal_only: bool = False,
+            idle: bool = True, max_wait_seconds: int = 21600) -> int:
     if not detach:
-        return _restart_worker(repo, wait_seconds, signal_only)
+        return _restart_worker(repo, wait_seconds, signal_only, idle, max_wait_seconds)
     if os.fork() != 0:
         print(f"restart detached; log: {LOG_PATH}")
         return 0
@@ -198,7 +237,7 @@ def restart(repo: Path, wait_seconds: int, detach: bool, signal_only: bool = Fal
     with open(os.devnull, "w") as devnull:
         os.dup2(devnull.fileno(), 1)
         os.dup2(devnull.fileno(), 2)
-    os._exit(_restart_worker(repo, wait_seconds, signal_only))
+    os._exit(_restart_worker(repo, wait_seconds, signal_only, idle, max_wait_seconds))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -208,10 +247,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--wait-seconds", type=int, default=120)
     parser.add_argument("--no-detach", action="store_true")
     parser.add_argument("--signal-only", action="store_true", help="send the signal and exit without waiting")
+    parser.add_argument("--no-idle", dest="idle", action="store_false",
+                        help="signal even while turns are running (interrupts them; not recommended)")
+    parser.add_argument("--max-wait-seconds", type=int, default=21600,
+                        help="how long to wait for an idle gateway before giving up (default 6h)")
     args = parser.parse_args(argv)
     if args.command == "check":
         return check(args.repo)
-    return restart(args.repo, args.wait_seconds, detach=not args.no_detach, signal_only=args.signal_only)
+    return restart(args.repo, args.wait_seconds, detach=not args.no_detach,
+                   signal_only=args.signal_only, idle=args.idle,
+                   max_wait_seconds=args.max_wait_seconds)
 
 
 if __name__ == "__main__":
