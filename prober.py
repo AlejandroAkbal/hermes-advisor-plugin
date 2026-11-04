@@ -189,15 +189,19 @@ def probe_symlink(link_path: str, expected_target: str | None = None) -> ProbeRe
     clean = os.path.expanduser(link_path.strip())
     try:
         try:
-            is_link = os.path.islink(clean)
+            st = os.lstat(clean)
+        except FileNotFoundError:
+            return ProbeResult(True, False, f"symlink: {clean}", f"test -L {clean}", "islink=False (exists=False)")
         except PermissionError as pe:
             return ProbeResult(False, False, f"symlink: {clean}", f"test -L {clean}", f"Probe inconclusive: {pe}")
-        if not is_link:
-            return ProbeResult(True, False, f"symlink: {clean}", f"test -L {clean}", f"islink=False (exists={os.path.exists(clean)})")
+        import stat
+        if not stat.S_ISLNK(st.st_mode):
+            return ProbeResult(True, False, f"symlink: {clean}", f"test -L {clean}", "islink=False (exists=True)")
         target = os.readlink(clean)
         if expected_target is not None:
             norm_tgt = os.path.abspath(os.path.join(os.path.dirname(clean), target))
-            norm_exp = os.path.abspath(os.path.expanduser(expected_target.strip()))
+            exp_clean = os.path.expanduser(expected_target.strip())
+            norm_exp = os.path.abspath(os.path.join(os.path.dirname(clean), exp_clean)) if not os.path.isabs(exp_clean) else exp_clean
             matches = (target == expected_target.strip()) or (norm_tgt == norm_exp)
             return ProbeResult(True, matches, f"symlink {clean} -> {expected_target.strip()}", f"test -L {clean} && readlink {clean}", f"islink=True target={target} (matches expected: {matches})")
         return ProbeResult(True, True, f"symlink exists: {clean}", f"test -L {clean}", f"islink=True target={target}")
@@ -732,7 +736,8 @@ def _extract_symlink_claims(draft: str, cwd: str) -> list[tuple[str, str | None]
     )
     ignored = {"the", "a", "an", "this", "that", "our", "new", "all", "each", "and", "or", "to", "is", "for", "with", "file", "folder", "directory", "path", "target", "link"}
     claims: list[tuple[str, str | None]] = []
-    seen: set[str] = set()
+    seen: set[tuple[str, str | None]] = set()
+    links_with_target: set[str] = set()
     for m in pat_tgt.finditer(draft):
         if _is_negated_claim(draft, m.start()):
             continue
@@ -740,9 +745,11 @@ def _extract_symlink_claims(draft: str, cwd: str) -> list[tuple[str, str | None]
         if not link or link.lower() in ignored or link.lower() in FILLER_WORDS or not target or target.lower() in ignored or target.lower() in FILLER_WORDS:
             continue
         exp = os.path.abspath(os.path.join(cwd, os.path.expanduser(link)))
-        if exp not in seen:
-            seen.add(exp)
-            claims.append((exp, target))
+        pair = (exp, target)
+        if pair not in seen:
+            seen.add(pair)
+            links_with_target.add(exp)
+            claims.append(pair)
     for m in pat_link.finditer(draft):
         if _is_negated_claim(draft, m.start()):
             continue
@@ -751,9 +758,10 @@ def _extract_symlink_claims(draft: str, cwd: str) -> list[tuple[str, str | None]
         if not link or link.lower() in ignored or link.lower() in FILLER_WORDS:
             continue
         exp = os.path.abspath(os.path.join(cwd, os.path.expanduser(link)))
-        if exp not in seen:
-            seen.add(exp)
-            claims.append((exp, None))
+        pair = (exp, None)
+        if exp not in links_with_target and pair not in seen:
+            seen.add(pair)
+            claims.append(pair)
     return claims
 
 
@@ -814,12 +822,13 @@ def run_active_probes_for_draft(draft: str, cwd: str) -> list[ProbeResult]:
 
     # 4. Probe file existence if explicit file creation or existence is asserted with a path-like token
     ext_pattern = r"(?:py|json|ya?ml|toml|md|txt|ts|js|sh|html|css|rs|go|log|lock|conf|cfg|ini|sql|bak|disabled|plist|dll|dylib|so|zip|tar|gz|tgz|pdf|png|jpe?g|svg|db|sqlite3?|env)"
+    file_pat = rf"([/~a-zA-Z0-9_\-./]*\.(?:{ext_pattern})(?![\w\-]|(?:\.[a-zA-Z0-9])))"
     post_verb_matches = re.findall(
-        rf"(?i)(?<!not )(?<!never )(?<!n't )\b(?:created|written\s+to|written\s+into|wrote|generated|saved|added|updated|modified)\s+(?:in|to|at)?\s*[`'\"]?([/~a-zA-Z0-9_\-./]+(?:\.{ext_pattern}))[`'\"]?",
+        rf"(?i)(?<!not )(?<!never )(?<!n't )\b(?:created|written\s+to|written\s+into|wrote|generated|saved|added|updated|modified)\s+(?:in|to|at)?\s*[`'\"]?{file_pat}[`'\"]?",
         scan_draft,
     )
     pre_verb_matches = re.findall(
-        rf"(?i)(?<!not )(?<!never )(?<!n't )[`'\"]?([/~a-zA-Z0-9_\-./]+(?:\.{ext_pattern}))[`'\"]?\s+exists?\b",
+        rf"(?i)(?<!not )(?<!never )(?<!n't )[`'\"]?{file_pat}[`'\"]?\s+exists?\b",
         scan_draft,
     )
     ignored_basenames = {"node.js", "react.js", "vue.js", "next.js", "deno.js"}

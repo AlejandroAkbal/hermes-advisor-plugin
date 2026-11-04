@@ -590,7 +590,7 @@ class TestActiveProber(unittest.TestCase):
             self.assertIn("islink=False", res_not_link.output)
 
             # 5. Inaccessible path triggers inconclusive result
-            with mock.patch("os.path.islink", side_effect=PermissionError("Permission denied")):
+            with mock.patch("os.lstat", side_effect=PermissionError("Permission denied")):
                 res_perm = probe_symlink("/restricted/symlink")
                 self.assertFalse(res_perm.executed)
                 self.assertFalse(res_perm.success)
