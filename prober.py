@@ -9,6 +9,7 @@ without requiring an extra agent turn:
 - Git remote verification (git remote get-url)
 - File existence / non-empty checks (test -e)
 - Path / file absence / deletion checks (test ! -e)
+- Symlink existence and target verification (test -L && readlink)
 - Directory existence (test -d)
 - Environment variable presence (test -n "$VAR")
 - Service presence (launchctl list)
@@ -181,6 +182,27 @@ def probe_file_absence(path: str) -> ProbeResult:
             command=f"test ! -e {clean_path} && test ! -L {clean_path}",
             output=f"Probe inconclusive: {e}",
         )
+
+
+def probe_symlink(link_path: str, expected_target: str | None = None) -> ProbeResult:
+    """Safely probe if a path is a symbolic link and optionally check its target."""
+    clean = os.path.expanduser(link_path.strip())
+    try:
+        try:
+            is_link = os.path.islink(clean)
+        except PermissionError as pe:
+            return ProbeResult(False, False, f"symlink: {clean}", f"test -L {clean}", f"Probe inconclusive: {pe}")
+        if not is_link:
+            return ProbeResult(True, False, f"symlink: {clean}", f"test -L {clean}", f"islink=False (exists={os.path.exists(clean)})")
+        target = os.readlink(clean)
+        if expected_target is not None:
+            norm_tgt = os.path.abspath(os.path.join(os.path.dirname(clean), target))
+            norm_exp = os.path.abspath(os.path.expanduser(expected_target.strip()))
+            matches = (target == expected_target.strip()) or (norm_tgt == norm_exp)
+            return ProbeResult(True, matches, f"symlink {clean} -> {expected_target.strip()}", f"test -L {clean} && readlink {clean}", f"islink=True target={target} (matches expected: {matches})")
+        return ProbeResult(True, True, f"symlink exists: {clean}", f"test -L {clean}", f"islink=True target={target}")
+    except Exception as e:
+        return ProbeResult(False, False, f"symlink: {clean}", f"test -L {clean}", f"Probe inconclusive: {e}")
 
 
 def probe_directory_existence(path: str) -> ProbeResult:
@@ -698,6 +720,43 @@ def _extract_env_vars(draft: str) -> list[str]:
     return vars_list
 
 
+def _extract_symlink_claims(draft: str, cwd: str) -> list[tuple[str, str | None]]:
+    """Safely extract claimed symlink paths and optional targets from draft, filtering negations."""
+    pat_tgt = re.compile(
+        r"\b(?:symlink|symbolic\s+link|symlinked|created\s+(?:a\s+)?symlink)\s+[`'\"\(]?([/~a-zA-Z0-9_\-./]+)[`'\"\)]?\s+(?:points\s+to|pointing\s+to|->|to)\s+[`'\"\(]?([/~a-zA-Z0-9_\-./]+)[`'\"\)]?",
+        re.IGNORECASE,
+    )
+    pat_link = re.compile(
+        r"\b(?:symlink|symbolic\s+link)\s+[`'\"\(]?([/~a-zA-Z0-9_\-./]+)[`'\"\)]?\s+(?:exists?|is\s+present|was\s+created)\b|\b(?:created|made)\s+(?:a\s+)?(?:symlink|symbolic\s+link)\s+[`'\"\(]?([/~a-zA-Z0-9_\-./]+)[`'\"\)]?\b",
+        re.IGNORECASE,
+    )
+    ignored = {"the", "a", "an", "this", "that", "our", "new", "all", "each", "and", "or", "to", "is", "for", "with", "file", "folder", "directory", "path", "target", "link"}
+    claims: list[tuple[str, str | None]] = []
+    seen: set[str] = set()
+    for m in pat_tgt.finditer(draft):
+        if _is_negated_claim(draft, m.start()):
+            continue
+        link, target = m.group(1).rstrip(".,;:!?)'\""), m.group(2).rstrip(".,;:!?)'\"")
+        if not link or link.lower() in ignored or link.lower() in FILLER_WORDS or not target or target.lower() in ignored or target.lower() in FILLER_WORDS:
+            continue
+        exp = os.path.abspath(os.path.join(cwd, os.path.expanduser(link)))
+        if exp not in seen:
+            seen.add(exp)
+            claims.append((exp, target))
+    for m in pat_link.finditer(draft):
+        if _is_negated_claim(draft, m.start()):
+            continue
+        raw = m.group(1) or m.group(2)
+        link = raw.rstrip(".,;:!?)'\"") if raw else ""
+        if not link or link.lower() in ignored or link.lower() in FILLER_WORDS:
+            continue
+        exp = os.path.abspath(os.path.join(cwd, os.path.expanduser(link)))
+        if exp not in seen:
+            seen.add(exp)
+            claims.append((exp, None))
+    return claims
+
+
 def run_active_probes_for_draft(draft: str, cwd: str) -> list[ProbeResult]:
     """Inspect draft for verifiable assertions and run safe read-only probes."""
     # Cap scanned draft length to prevent pathological scanning overhead
@@ -754,9 +813,9 @@ def run_active_probes_for_draft(draft: str, cwd: str) -> list[ProbeResult]:
                 probes.append(res)
 
     # 4. Probe file existence if explicit file creation or existence is asserted with a path-like token
-    ext_pattern = r"(?:py|json|ya?ml|toml|md|txt|ts|js|sh|html|css|rs|go|log|lock|conf|cfg|ini|sql|bak|disabled|plist)"
+    ext_pattern = r"(?:py|json|ya?ml|toml|md|txt|ts|js|sh|html|css|rs|go|log|lock|conf|cfg|ini|sql|bak|disabled|plist|dll|dylib|so|zip|tar|gz|tgz|pdf|png|jpe?g|svg|db|sqlite3?|env)"
     post_verb_matches = re.findall(
-        rf"(?i)(?<!not )(?<!never )(?<!n't )\b(?:created|written\s+to|written\s+into|saved|added)\s+(?:in|to|at)?\s*[`'\"]?([/~a-zA-Z0-9_\-./]+(?:\.{ext_pattern}))[`'\"]?",
+        rf"(?i)(?<!not )(?<!never )(?<!n't )\b(?:created|written\s+to|written\s+into|wrote|generated|saved|added|updated|modified)\s+(?:in|to|at)?\s*[`'\"]?([/~a-zA-Z0-9_\-./]+(?:\.{ext_pattern}))[`'\"]?",
         scan_draft,
     )
     pre_verb_matches = re.findall(
@@ -917,5 +976,18 @@ def run_active_probes_for_draft(draft: str, cwd: str) -> list[ProbeResult]:
                 seen_absent_paths.add(expanded_path)
                 probes.append(probe_file_absence(expanded_path))
                 absence_count += 1
+
+    # 14. Probe symlinks if asserted (bounded by budget)
+    MAX_SYMLINK_PROBES = 5
+    symlink_count = 0
+    seen_symlink_keys: set[tuple[str, str | None]] = set()
+    for link_p, target_p in _extract_symlink_claims(scan_draft, cwd):
+        if symlink_count >= MAX_SYMLINK_PROBES:
+            break
+        key = (link_p, target_p)
+        if key not in seen_symlink_keys:
+            seen_symlink_keys.add(key)
+            probes.append(probe_symlink(link_p, target_p))
+            symlink_count += 1
 
     return probes

@@ -25,6 +25,7 @@ try:
         probe_port_listening,
         probe_process_running,
         probe_service_running,
+        probe_symlink,
         run_active_probes_for_draft,
     )
     from hermes_plugins.advisor.runtime import AdvisorRuntime
@@ -45,6 +46,7 @@ except ImportError:
         probe_port_listening,
         probe_process_running,
         probe_service_running,
+        probe_symlink,
         run_active_probes_for_draft,
     )
     from advisor.runtime import AdvisorRuntime
@@ -554,6 +556,66 @@ class TestActiveProber(unittest.TestCase):
             draft_pyc = "I deleted cache.pyc from the repository."
             probes_pyc = run_active_probes_for_draft(draft_pyc, tmp_dir)
             self.assertFalse(any("cache.py" in p.claim for p in probes_pyc))
+
+    def test_probe_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            target = os.path.join(tmp_dir, "real_target.txt")
+            with open(target, "w") as f:
+                f.write("data")
+            link = os.path.join(tmp_dir, "link_to_target")
+            os.symlink(target, link)
+
+            # 1. Probe valid symlink without expected target
+            res_link = probe_symlink(link)
+            self.assertTrue(res_link.executed)
+            self.assertTrue(res_link.success)
+            self.assertIn("islink=True", res_link.output)
+
+            # 2. Probe valid symlink with matching expected target
+            res_match = probe_symlink(link, target)
+            self.assertTrue(res_match.executed)
+            self.assertTrue(res_match.success)
+            self.assertIn("matches expected: True", res_match.output)
+
+            # 3. Probe valid symlink with mismatched expected target
+            res_mismatch = probe_symlink(link, "/tmp/different_target")
+            self.assertTrue(res_mismatch.executed)
+            self.assertFalse(res_mismatch.success)
+            self.assertIn("matches expected: False", res_mismatch.output)
+
+            # 4. Probe regular file (not a symlink)
+            res_not_link = probe_symlink(target)
+            self.assertTrue(res_not_link.executed)
+            self.assertFalse(res_not_link.success)
+            self.assertIn("islink=False", res_not_link.output)
+
+            # 5. Inaccessible path triggers inconclusive result
+            with mock.patch("os.path.islink", side_effect=PermissionError("Permission denied")):
+                res_perm = probe_symlink("/restricted/symlink")
+                self.assertFalse(res_perm.executed)
+                self.assertFalse(res_perm.success)
+                self.assertIn("permission denied", res_perm.output.lower())
+
+    def test_run_active_probes_for_symlinks(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            target = os.path.join(tmp_dir, "file.txt")
+            with open(target, "w") as f:
+                f.write("content")
+            link = os.path.join(tmp_dir, "my_link")
+            os.symlink(target, link)
+
+            # Claim symlink pointing to target
+            draft = f"I created symlink {link} pointing to {target}."
+            probes = run_active_probes_for_draft(draft, tmp_dir)
+            sym_probe = next((p for p in probes if "symlink" in p.claim), None)
+            self.assertIsNotNone(sym_probe)
+            assert sym_probe is not None
+            self.assertTrue(sym_probe.success)
+
+            # Negated symlink claim should not trigger probe
+            draft_neg = f"I did not create symlink {link} to {target}."
+            probes_neg = run_active_probes_for_draft(draft_neg, tmp_dir)
+            self.assertFalse(any("symlink" in p.claim for p in probes_neg))
 
     def test_probe_git_clean_status(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
