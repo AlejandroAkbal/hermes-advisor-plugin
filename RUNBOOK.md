@@ -22,13 +22,16 @@ The 8-hour cron runs this loop. Work only inside this repo; never edit
 7. **Make it live.** A merged change is dead code until the gateway loads it:
    `python3 scripts/gateway_live.py check`
    - exit 0 — the gateway started after the newest commit: live.
-   - exit 3 — stale. Create a one-shot restart and let the gateway drain
-     in-flight turns:
+   - exit 3 — stale. Arm the idle-gated restart and let it fire in a gap:
      `cronjob_manage(action="create", name="Delayed gateway restart",
      schedule="in 2m", repeat=1, no_agent=True, script="gateway-live-restart.py",
      deliver="local", prompt="Restart the gateway so the merged advisor changes load.")`
+     The worker detaches, polls `~/.hermes/gateway_state.json`, and only sends
+     SIGUSR1 when `active_agents == 0`; it waits up to six hours and then gives
+     up **without signalling** (exit 6). Never add `--no-idle` to a scheduled
+     restart: that interrupts whatever is running.
    - Never report the run as done while check exits 3. Report "merged, restart
-     scheduled" plus the PID start time and commit time the check printed.
+     armed" plus the PID start time and commit time the check printed.
 8. **Report.** The change, the test count, the latency/approval numbers, and the
    liveness line.
 
@@ -36,8 +39,15 @@ The 8-hour cron runs this loop. Work only inside this repo; never edit
 
 - Never run a gateway restart command directly from an agent turn: the terminal
   guard refuses it because SIGTERM would kill the command. Step 7 exists for that.
-- `gateway-live-restart.py` (in `~/.hermes/scripts/`) sends SIGUSR1, the same
-  graceful path `systemctl reload` uses; in-band restarts bypass launchd's
-  `ExitTimeOut` (`gateway/run_bootstrap.py:234`), so in-flight turns drain first.
-- Sessions persist in `state.db`; a restart costs at most one interrupted turn.
-- Commit messages describe behaviour, not incident history.
+- Never signal the PID printed by `hermes gateway status`: that is the launchd
+  osascript wrapper. SIGUSR1 kills the wrapper, launchd then SIGTERMs the real
+  gateway, and the drain is skipped. `scripts/gateway_live.py` reads
+  `~/.hermes/gateway.pid` instead and refuses wrapper PIDs.
+- Restarts are idle-gated for a reason: the gateway's own drain caps at
+  `agent.restart_after_turn_timeout` (7200s here) and force-drains past it, which
+  interrupts live turns. Signalling only when `active_agents == 0` means there is
+  nothing to interrupt, so sessions never notice the restart.
+- `gateway-live-restart.py` (in `~/.hermes/scripts/`) runs the idle-gated restart
+  detached, so it survives the gateway it is restarting.
+- Sessions persist in `state.db`; a restart costs at most one interrupted turn,
+  and with idle-gating even that does not happen.
